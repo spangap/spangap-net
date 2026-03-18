@@ -234,9 +234,7 @@ static bool loadAndConfigure() {
 /* ---- Public API ---- */
 
 static bool anySslPort() {
-    return cfgGetInt("https_port", 443) > 0 ||
-           cfgGetInt("logs_port") > 0 ||
-           cfgGetInt("clis_port") > 0;
+    return cfgGetInt("https_port", 443) > 0;
 }
 
 void tlsInit() {
