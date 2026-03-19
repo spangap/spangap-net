@@ -5,11 +5,11 @@ Sets system time from NTP. Include `ntp.h`.
 ## Usage
 
 ```cpp
-ntpBegin();  // call after WiFi is connected (blocks up to 30s for sync)
+ntpBegin();  // call after WiFi is connected (non-blocking, just calls esp_sntp_init)
 ntpStop();   // stop SNTP (call before network down)
 ```
 
-`ntpBegin()` configures `esp_sntp`, then polls `gettimeofday()` every 500ms for up to 30s. Logs the synced time via `info()` on success, or "no time after 30s" on timeout. Runs on the network task.
+`ntpBegin()` configures and starts `esp_sntp` (non-blocking). The blocking wait for time sync is in `main.cpp`'s `waitForTime()`, which blocks the main task until valid time (>Jan 1 2026), then releases the boot deep sleep lock. A 30s one-shot FreeRTOS timer logs the synced time. Runs on the network task.
 
 **Important**: `esp_sntp_setservername()` stores the pointer, not a copy. The server buffer is `static` to avoid dangling pointer.
 
