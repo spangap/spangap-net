@@ -228,6 +228,15 @@ static bool loadAndConfigure() {
     /* Authmode: none (self-signed, no client certs) */
     mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
 
+    /* ChaCha20-Poly1305 only — faster in software on Xtensa than AES-GCM,
+     * and avoids the ESP32-S3 hardware GCM DMA bug entirely.
+     * All modern browsers support this cipher suite. */
+    static const int ciphersuites[] = {
+        MBEDTLS_TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        0
+    };
+    mbedtls_ssl_conf_ciphersuites(&conf, ciphersuites);
+
     return true;
 }
 
