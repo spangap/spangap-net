@@ -53,4 +53,16 @@ size_t tlsBytesAvail(tls_conn_t* conn);
  *  Call from CLI context — blocks for ~2s. */
 void tlsRegenCert();
 
+/** Get SHA-256 fingerprint of DER cert as "XX:XX:..." string (for SDP).
+ *  Returns false if TLS not ready. */
+bool tlsCertFingerprint(char* out, size_t outLen);
+
+/** Access shared RNG, cert and key for DTLS config. */
+struct mbedtls_ctr_drbg_context;
+struct mbedtls_x509_crt;
+struct mbedtls_pk_context;
+mbedtls_ctr_drbg_context* tlsGetRng();
+mbedtls_x509_crt*         tlsGetCert();
+mbedtls_pk_context*        tlsGetKey();
+
 #endif

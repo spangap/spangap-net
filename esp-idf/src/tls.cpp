@@ -25,6 +25,7 @@
 #include "mbedtls/x509.h"
 #include "mbedtls/x509_crt.h"
 #include "mbedtls/error.h"
+#include "mbedtls/sha256.h"
 #include "mbedtls/bignum.h"
 #include "esp_heap_caps.h"
 
@@ -411,6 +412,20 @@ void tlsClose(tls_conn_t*& conn) {
     heap_caps_free(conn);
     conn = nullptr;
 }
+
+bool tlsCertFingerprint(char* out, size_t outLen) {
+    if (!ready || outLen < 96) return false;  /* "sha-256 XX:XX:...\0" = 95 chars */
+    uint8_t hash[32];
+    mbedtls_sha256(srvcert.raw.p, srvcert.raw.len, hash, 0);
+    int pos = snprintf(out, outLen, "sha-256 ");
+    for (int i = 0; i < 32; i++)
+        pos += snprintf(out + pos, outLen - pos, "%s%02X", i ? ":" : "", hash[i]);
+    return true;
+}
+
+mbedtls_ctr_drbg_context* tlsGetRng()  { return &ctr_drbg; }
+mbedtls_x509_crt*         tlsGetCert() { return &srvcert; }
+mbedtls_pk_context*        tlsGetKey()  { return &pkey; }
 
 static void tlsRegenTask(void* arg) {
     info("regenerating TLS cert...\n");
