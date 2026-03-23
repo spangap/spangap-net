@@ -633,7 +633,7 @@ static void netTaskFn(void* arg) {
 /* ---- Public API ---- */
 
 static void netCliCmd(const char* args) {
-    if (strcmp(args, "help") == 0) { cliPrintf("  %-*s [up|down|down!]  WiFi control\n", CLI_HELP_COL, "net"); return; }
+    if (strcmp(args, "help") == 0) { cliPrintf("  %-*s WiFi control\n", CLI_HELP_COL, "net [up|down|down!]"); return; }
     if (strcmp(args, "up") == 0) netUp();
     else if (strcmp(args, "down!") == 0) netForceDown();
     else if (strcmp(args, "down") == 0) netDown();

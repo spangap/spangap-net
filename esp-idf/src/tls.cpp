@@ -300,7 +300,7 @@ void tlsInit() {
         info("TLS ready\n");
     }
     cliRegisterCmd("tls keygen", [](const char* a) {
-        if (strcmp(a, "help") == 0) { cliPrintf("  %-*s keygen             regenerate TLS certificate\n", CLI_HELP_COL, "tls"); return; }
+        if (strcmp(a, "help") == 0) { cliPrintf("  %-*s regenerate TLS certificate\n", CLI_HELP_COL, "tls keygen"); return; }
         tlsRegenCert();
     });
 }
