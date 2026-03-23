@@ -10,6 +10,9 @@
 #include "compat.h"
 #include "nvs_config.h"
 #include "ipc.h"
+#include "pm.h"
+#include "log.h"
+#include "cli.h"
 #include "its.h"
 #include "tls.h"
 #include <lwip/sockets.h>
@@ -629,8 +632,17 @@ static void netTaskFn(void* arg) {
 
 /* ---- Public API ---- */
 
+static void netCliCmd(const char* args) {
+    if (strcmp(args, "help") == 0) { cliPrintf("  %-*s [up|down|down!]  WiFi control\n", CLI_HELP_COL, "net"); return; }
+    if (strcmp(args, "up") == 0) netUp();
+    else if (strcmp(args, "down!") == 0) netForceDown();
+    else if (strcmp(args, "down") == 0) netDown();
+    else cliPrintf("usage: net [up|down|down!]\n");
+}
+
 void netInit() {
   pmLockCreate(PM_NO_DEEP_SLEEP, "net", &netDeepLock);
+  cliRegisterCmd("net", netCliCmd);
 
   for (int i = 0; i < NET_MAX_CLIENTS; i++) {
     netClients[i].fd = -1;

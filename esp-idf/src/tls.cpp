@@ -3,7 +3,8 @@
  */
 #include "tls.h"
 #include "cfg.h"
-#include "ipc.h"
+#include "log.h"
+#include "cli.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -298,6 +299,10 @@ void tlsInit() {
         ready = true;
         info("TLS ready\n");
     }
+    cliRegisterCmd("tls keygen", [](const char* a) {
+        if (strcmp(a, "help") == 0) { cliPrintf("  %-*s keygen             regenerate TLS certificate\n", CLI_HELP_COL, "tls"); return; }
+        tlsRegenCert();
+    });
 }
 
 bool tlsReady() { return ready; }
