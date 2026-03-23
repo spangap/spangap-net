@@ -53,6 +53,9 @@ size_t tlsBytesAvail(tls_conn_t* conn);
  *  Call from CLI context — blocks for ~2s. */
 void tlsRegenCert();
 
+/** Reload cert + key from NVS (after ACME renewal). */
+void tlsReloadCert();
+
 /** Get SHA-256 fingerprint of DER cert as "XX:XX:..." string (for SDP).
  *  Returns false if TLS not ready. */
 bool tlsCertFingerprint(char* out, size_t outLen);

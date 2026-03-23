@@ -15,7 +15,7 @@
 #include <string>
 #include <lwip/sockets.h>
 #include <fcntl.h>
-#include <nvs.h>
+
 
 #include "mbedtls/ssl.h"
 #include "mbedtls/entropy.h"
@@ -45,29 +45,33 @@ static mbedtls_pk_context pkey;
 static mbedtls_ssl_config conf;
 static bool ready = false;
 
-/* ---- NVS blob helpers ---- */
+/* ---- State file helpers (certs stored on /state/ LittleFS partition) ---- */
 
-#define NVS_NAMESPACE "seccam"
-
-static bool nvsSetBlob(const char* key, const uint8_t* data, size_t len) {
-    nvs_handle_t h;
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return false;
-    esp_err_t err = nvs_set_blob(h, key, data, len);
-    if (err == ESP_OK) err = nvs_commit(h);
-    nvs_close(h);
-    return err == ESP_OK;
+static std::string statePath(const char* key) {
+    return std::string("/state/") + key + ".pem";
 }
 
-static bool nvsGetBlobStr(const char* key, std::string& out) {
-    nvs_handle_t h;
-    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return false;
-    size_t len = 0;
-    esp_err_t err = nvs_get_blob(h, key, nullptr, &len);
-    if (err != ESP_OK || len == 0) { nvs_close(h); return false; }
-    out.resize(len);
-    err = nvs_get_blob(h, key, out.data(), &len);
-    nvs_close(h);
-    return err == ESP_OK;
+static bool stateWrite(const char* key, const uint8_t* data, size_t len) {
+    auto path = statePath(key);
+    FILE* f = fopen(path.c_str(), "w");
+    if (!f) return false;
+    size_t written = fwrite(data, 1, len, f);
+    fclose(f);
+    return written == len;
+}
+
+static bool stateRead(const char* key, std::string& out) {
+    auto path = statePath(key);
+    FILE* f = fopen(path.c_str(), "r");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0) { fclose(f); return false; }
+    out.resize((size_t)sz);
+    fread(out.data(), 1, (size_t)sz, f);
+    fclose(f);
+    return true;
 }
 
 /* ---- NVS hostname for cert CN ---- */
@@ -82,7 +86,7 @@ static std::string nvsHostnameLocal() {
 
 static bool certMatchesHostname() {
     std::string certPem;
-    if (!nvsGetBlobStr("tls_cert", certPem)) return false;
+    if (!stateRead("tls_cert", certPem)) return false;
 
     mbedtls_x509_crt tmp;
     mbedtls_x509_crt_init(&tmp);
@@ -175,8 +179,8 @@ static bool generateCert() {
                                          mbedtls_ctr_drbg_random, &ctr_drbg);
         if (ret != 0) { err("crt_pem: -0x%04x\n", -ret); goto fail; }
         size_t certLen = strlen((char*)buf) + 1;  /* include NUL for PEM parsing */
-        if (!nvsSetBlob("tls_cert", buf, certLen)) {
-            err("NVS write tls_cert failed\n");
+        if (!stateWrite("tls_cert", buf, certLen)) {
+            err("write tls_cert failed\n");
             goto fail;
         }
 
@@ -184,8 +188,8 @@ static bool generateCert() {
         ret = mbedtls_pk_write_key_pem(&key, buf, sizeof(buf));
         if (ret != 0) { err("pk_pem: -0x%04x\n", -ret); goto fail; }
         size_t keyLen = strlen((char*)buf) + 1;
-        if (!nvsSetBlob("tls_key", buf, keyLen)) {
-            err("NVS write tls_key failed\n");
+        if (!stateWrite("tls_key", buf, keyLen)) {
+            err("write tls_key failed\n");
             goto fail;
         }
     }
@@ -205,8 +209,8 @@ fail:
 
 static bool loadAndConfigure() {
     std::string certPem, keyPem;
-    if (!nvsGetBlobStr("tls_cert", certPem)) { err("no tls_cert in NVS\n"); return false; }
-    if (!nvsGetBlobStr("tls_key", keyPem))   { err("no tls_key in NVS\n"); return false; }
+    if (!stateRead("tls_cert", certPem)) { err("no tls_cert\n"); return false; }
+    if (!stateRead("tls_key", keyPem))   { err("no tls_key\n"); return false; }
 
     int ret;
     ret = mbedtls_x509_crt_parse(&srvcert, (const uint8_t*)certPem.c_str(), certPem.size());
@@ -266,11 +270,27 @@ void tlsInit() {
         return;
     }
 
-    /* Generate cert if missing or hostname mismatch */
+    /* Generate cert if missing or hostname mismatch (but keep ACME certs) */
     if (!certMatchesHostname()) {
-        if (!generateCert()) {
-            err("cert generation failed\n");
-            return;
+        /* Check if existing cert is from a real CA (ACME) — don't overwrite */
+        std::string existingCert;
+        bool isAcmeCert = false;
+        if (stateRead("tls_cert", existingCert)) {
+            mbedtls_x509_crt tmp;
+            mbedtls_x509_crt_init(&tmp);
+            if (mbedtls_x509_crt_parse(&tmp, (const uint8_t*)existingCert.c_str(),
+                                        existingCert.size()) == 0) {
+                isAcmeCert = (tmp.issuer_raw.len != tmp.subject_raw.len ||
+                              memcmp(tmp.issuer_raw.p, tmp.subject_raw.p,
+                                     tmp.issuer_raw.len) != 0);
+            }
+            mbedtls_x509_crt_free(&tmp);
+        }
+        if (!isAcmeCert) {
+            if (!generateCert()) {
+                err("cert generation failed\n");
+                return;
+            }
         }
     }
 
@@ -354,7 +374,7 @@ tls_conn_t* tlsAccept(int serverFd) {
         if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
             char errbuf[128];
             mbedtls_strerror(ret, errbuf, sizeof(errbuf));
-            info("%sTLS handshake: -0x%04x %s\n", cfd(fd), -ret, errbuf);
+            dbg("%sTLS handshake: -0x%04x %s\n", cfd(fd), -ret, errbuf);
             mbedtls_ssl_free(&conn->ssl);
             heap_caps_free(conn);
             close(fd);
@@ -451,6 +471,24 @@ static void tlsRegenTask(void* arg) {
     SemaphoreHandle_t sem = (SemaphoreHandle_t)arg;
     if (sem) xSemaphoreGive(sem);
     vTaskDelete(nullptr);
+}
+
+void tlsReloadCert() {
+    if (ready) {
+        mbedtls_x509_crt_free(&srvcert);
+        mbedtls_pk_free(&pkey);
+        mbedtls_ssl_config_free(&conf);
+        mbedtls_x509_crt_init(&srvcert);
+        mbedtls_pk_init(&pkey);
+        mbedtls_ssl_config_init(&conf);
+        ready = false;
+    }
+    if (loadAndConfigure()) {
+        ready = true;
+        info("TLS cert reloaded\n");
+    } else {
+        err("TLS cert reload failed\n");
+    }
 }
 
 void tlsRegenCert() {
