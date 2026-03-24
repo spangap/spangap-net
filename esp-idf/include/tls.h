@@ -2,8 +2,8 @@
  * tls — mbedTLS server wrapper for HTTPS, secure WS, etc.
  *
  * - EC P-256 self-signed cert, generated on first boot when any SSL port is
- *   non-zero and no cert matching <hostname>.local exists in NVS.
- * - Cert + private key stored as NVS blobs (tls_cert / tls_key).
+ *   non-zero and no cert matching <hostname>.local exists on /state/.
+ * - Cert + private key stored as PEM files on /state/ (tls_cert / tls_key).
  * - Shared server SSL config (one cert, reused by all listening tasks).
  * - Per-connection tls_fd_t wraps mbedtls_ssl_context + raw fd.
  * - tlsRead/tlsWrite/tlsClose mirror recv/send/close semantics.
@@ -20,7 +20,7 @@
  */
 typedef struct tls_conn tls_conn_t;
 
-/** Initialize TLS subsystem.  Call once from app_main after cfgLoad + nvsRunBoot.
+/** Initialize TLS subsystem.  Call once from app_main after storageLoad + nvsRunBoot.
  *  Generates cert if needed (may take ~2 s for EC P-256). */
 void tlsInit();
 
@@ -53,7 +53,7 @@ size_t tlsBytesAvail(tls_conn_t* conn);
  *  Call from CLI context — blocks for ~2s. */
 void tlsRegenCert();
 
-/** Reload cert + key from NVS (after ACME renewal). */
+/** Reload cert + key from /state/ (after ACME renewal). */
 void tlsReloadCert();
 
 /** Get SHA-256 fingerprint of DER cert as "XX:XX:..." string (for SDP).

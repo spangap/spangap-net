@@ -1,8 +1,8 @@
 /**
- * tls — mbedTLS server: EC P-256 self-signed cert, NVS storage, per-connection wrappers.
+ * tls — mbedTLS server: EC P-256 self-signed cert, /state/ storage, per-connection wrappers.
  */
 #include "tls.h"
-#include "cfg.h"
+#include "storage.h"
 #include "log.h"
 #include "cli.h"
 #include "freertos/FreeRTOS.h"
@@ -75,11 +75,11 @@ static bool stateRead(const char* key, std::string& out) {
     return true;
 }
 
-/* ---- NVS hostname for cert CN ---- */
+/* ---- Config hostname for cert CN ---- */
 
 static std::string nvsHostnameLocal() {
     char hostname[32];
-    cfgGetStr("hostname", hostname, sizeof(hostname), "seccam");
+    storageGetStr("s.net.hostname", hostname, sizeof(hostname), "seccam");
     return std::string(hostname) + ".local";
 }
 
@@ -206,7 +206,7 @@ fail:
     return false;
 }
 
-/* ---- Load cert + key from NVS, init SSL config ---- */
+/* ---- Load cert + key from /state/, init SSL config ---- */
 
 static bool loadAndConfigure() {
     std::string certPem, keyPem;
@@ -249,7 +249,7 @@ static bool loadAndConfigure() {
 /* ---- Public API ---- */
 
 static bool anySslPort() {
-    return cfgGetInt("https_port", 443) > 0;
+    return storageGetInt("s.net.https_port", 443) > 0;
 }
 
 void tlsInit() {
@@ -499,7 +499,7 @@ void tlsReloadCert() {
 void tlsRegenCert() {
     /* EC key gen needs ~10KB stack — run on a temporary task */
     SemaphoreHandle_t sem = xSemaphoreCreateBinary();
-    xTaskCreatePinnedToCoreWithCaps(tlsRegenTask, "tls_gen", 16384, sem, 1, nullptr, 0, MALLOC_CAP_SPIRAM);
+    xTaskCreatePinnedToCoreWithCaps(tlsRegenTask, "tls_gen", 16384, sem, 1, nullptr, 0, MALLOC_CAP_DEFAULT);
     xSemaphoreTake(sem, portMAX_DELAY);
     vSemaphoreDelete(sem);
 }

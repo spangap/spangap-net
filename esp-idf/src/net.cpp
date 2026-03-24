@@ -6,7 +6,7 @@
  * Events: modules register callbacks via netRegister() for UP/DOWN/CFG/POLL.
  */
 #include "net.h"
-#include "cfg.h"
+#include "storage.h"
 #include "compat.h"
 #include "nvs_config.h"
 #include "ipc.h"
@@ -42,7 +42,7 @@ static volatile bool wantDown = false;
 static volatile uint32_t lastActivityMs = 0;
 #define WIFI_IDLE_TIMEOUT_MS 30000
 
-/* Known STA networks loaded from NVS */
+/* Known STA networks loaded from config (s.wifi.1..9) */
 static struct {
   char ssid[33];
   char pass[65];
@@ -113,7 +113,7 @@ static net_endpoint_t* epFindByKey(const char* nvsKey) {
 }
 
 /* ITS aux callback: tasks register TCP endpoints */
-static void netOnAux(TaskHandle_t sender, const void* data, size_t len) {
+static void netOnAux(TaskHandle_t sender, uint16_t port, const void* data, size_t len) {
     if (len < sizeof(net_port_msg_t)) return;
     auto* msg = (const net_port_msg_t*)data;
     net_endpoint_t* ep = epFindByKey(msg->nvsKey);
@@ -135,7 +135,7 @@ static void netOnAux(TaskHandle_t sender, const void* data, size_t len) {
 }
 
 static void epOpenPort(net_endpoint_t& ep) {
-    int newPort = cfgGetInt(ep.nvsKey, ep.defaultPort);
+    int newPort = storageGetInt(ep.nvsKey, ep.defaultPort);
     if (newPort == ep.port && (newPort <= 0 || ep.serverFd >= 0)) return;
     if (ep.serverFd >= 0) {
         info("closing port %d (%s)\n", ep.port, ep.nvsKey);
@@ -340,20 +340,20 @@ static void wifiHwStart() {
 static void loadNetworks() {
   staCount = 0;
   for (int i = 1; i <= MAX_STA_NETWORKS; i++) {
-    char key[16];
-    snprintf(key, sizeof(key), "wifi%d_ssid", i);
-    cfgGetStr(key, staNet[staCount].ssid, sizeof(staNet[0].ssid));
+    char key[24];
+    snprintf(key, sizeof(key), "s.wifi.%d.ssid", i);
+    storageGetStr(key, staNet[staCount].ssid, sizeof(staNet[0].ssid));
     if (!staNet[staCount].ssid[0]) break;
-    snprintf(key, sizeof(key), "wifi%d_pass", i);
-    cfgGetStr(key, staNet[staCount].pass, sizeof(staNet[0].pass));
-    snprintf(key, sizeof(key), "wifi%d_ip", i);
-    cfgGetStr(key, staNet[staCount].ip, sizeof(staNet[0].ip));
-    snprintf(key, sizeof(key), "wifi%d_gw", i);
-    cfgGetStr(key, staNet[staCount].gw, sizeof(staNet[0].gw));
-    snprintf(key, sizeof(key), "wifi%d_mask", i);
-    cfgGetStr(key, staNet[staCount].mask, sizeof(staNet[0].mask));
-    snprintf(key, sizeof(key), "wifi%d_dns", i);
-    cfgGetStr(key, staNet[staCount].dns, sizeof(staNet[0].dns));
+    snprintf(key, sizeof(key), "s.wifi.%d.pass", i);
+    storageGetStr(key, staNet[staCount].pass, sizeof(staNet[0].pass));
+    snprintf(key, sizeof(key), "s.wifi.%d.ip", i);
+    storageGetStr(key, staNet[staCount].ip, sizeof(staNet[0].ip));
+    snprintf(key, sizeof(key), "s.wifi.%d.gw", i);
+    storageGetStr(key, staNet[staCount].gw, sizeof(staNet[0].gw));
+    snprintf(key, sizeof(key), "s.wifi.%d.mask", i);
+    storageGetStr(key, staNet[staCount].mask, sizeof(staNet[0].mask));
+    snprintf(key, sizeof(key), "s.wifi.%d.dns", i);
+    storageGetStr(key, staNet[staCount].dns, sizeof(staNet[0].dns));
     info("loaded wifi%d ssid='%s'(%d) pass='%s'(%d)\n", i,
          staNet[staCount].ssid, (int)strlen(staNet[staCount].ssid),
          staNet[staCount].pass, (int)strlen(staNet[staCount].pass));
@@ -376,6 +376,9 @@ static int scanForKnown() {
   for (int i = 0; i < ap_count; i++)
     dbg("  '%s' ch%d %ddBm\n", (const char*)ap_list[i].ssid, ap_list[i].primary, ap_list[i].rssi);
   int bestIdx = -1;
+  info("known networks: %d\n", staCount);
+  for (int s = 0; s < staCount; s++)
+    info("  [%d] '%s'\n", s, staNet[s].ssid);
   for (int s = 0; s < staCount; s++)
     for (int i = 0; i < ap_count; i++)
       if (strcmp((const char*)ap_list[i].ssid, staNet[s].ssid) == 0) { bestIdx = s; goto found; }
@@ -442,12 +445,12 @@ static bool connectSta(int idx) {
 }
 
 static bool startAP() {
-  if (cfgGetInt("wifi0_disable")) { info("AP disabled\n"); return false; }
+  if (storageGetInt("s.wifi.0.disable")) { info("AP disabled\n"); return false; }
   char ssid[33], pass[65], ip[16], mask[16];
-  cfgGetStr("wifi0_ssid", ssid, sizeof(ssid), WIFI_AP_SSID);
-  cfgGetStr("wifi0_pass", pass, sizeof(pass), WIFI_AP_PASS);
-  cfgGetStr("wifi0_ip",   ip,   sizeof(ip),   WIFI_AP_IP);
-  cfgGetStr("wifi0_mask", mask, sizeof(mask),  WIFI_AP_MASK);
+  storageGetStr("s.wifi.0.ssid", ssid, sizeof(ssid), WIFI_AP_SSID);
+  storageGetStr("s.wifi.0.pass", pass, sizeof(pass), WIFI_AP_PASS);
+  storageGetStr("s.wifi.0.ip",   ip,   sizeof(ip),   WIFI_AP_IP);
+  storageGetStr("s.wifi.0.mask", mask, sizeof(mask),  WIFI_AP_MASK);
   esp_wifi_set_mode(WIFI_MODE_AP);
   esp_netif_dhcps_stop(ap_netif);
   esp_netif_ip_info_t ip_info = {};
@@ -473,9 +476,9 @@ static bool startAP() {
 }
 
 static void setDhcpHostname() {
-  if (cfgGetInt("mdns", 1)) {
+  if (storageGetInt("s.net.mdns", 1)) {
     char hostname[32];
-    cfgGetStr("hostname", hostname, sizeof(hostname), "seccam");
+    storageGetStr("s.net.hostname", hostname, sizeof(hostname), "seccam");
     esp_netif_set_hostname(sta_netif, hostname);
   } else {
     esp_netif_set_hostname(sta_netif, "");
@@ -514,12 +517,20 @@ static void doDown(wifi_state_t& state) {
 
 static void netTaskFn(void* arg) {
   ipcEnsureRegistered("net", 8);
-  itsClientInit(NET_MAX_CLIENTS, netItsDisconnect, netOnAux);
+  itsClientInit(NET_MAX_CLIENTS, netItsDisconnect);
+  itsOnAux(netOnAux);
+
+  storageSubscribeChanges("s.", ON_CHANGE {
+    if (!netIsUp()) return;
+    fireEvent(NET_EV_CFG_CHANGED, key);
+    epOpenAll();
+  });
+
   wifiNetifInit();
 
   xSemaphoreGive(readySem);  /* unblock netInit — task is running */
 
-  int searchTimeout = cfgGetInt("wifi_timeout");
+  int searchTimeout = storageGetInt("s.wifi.timeout");
   wifi_state_t state = ST_OFF;
   uint32_t scanStartMs = millis();
   uint32_t lastApRetryMs = 0;
@@ -563,11 +574,8 @@ static void netTaskFn(void* arg) {
         }
         continue;
       }
-      if (msg.type == MSG_CFG_CHANGED && connected) {
-        fireEvent(NET_EV_CFG_CHANGED, msg.cfg.key);
-        epOpenAll();
-      }
     }
+    while (itsPoll()) {}  /* config change subscriptions */
 
     if (wantDown && connected) {
       if (millis() - lastActivityMs >= WIFI_IDLE_TIMEOUT_MS) {
@@ -652,7 +660,7 @@ void netInit() {
   netProxyBuf = (uint8_t*)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
 
   if (!rtcValid())
-    rtcWifiUp = cfgGetInt("wifi_enable", 1) != 0;
+    rtcWifiUp = storageGetInt("s.wifi.enable", 1) != 0;
 
   loadNetworks();
   readySem = xSemaphoreCreateBinary();

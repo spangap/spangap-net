@@ -75,8 +75,8 @@ typedef struct {
     uint8_t tcpNoDelay;   /* 1 = TCP_NODELAY (default 1) */
     uint8_t keepAlive;    /* 1 = SO_KEEPALIVE */
     uint8_t backlog;      /* listen backlog (0 = default 4) */
-    char nvsKey[16];      /* NVS key for dynamic port (e.g. "rtsp_port") */
-    int  defaultPort;     /* default if NVS key missing */
+    char nvsKey[16];      /* config key for dynamic port (e.g. "s.net.rtsp_port") */
+    int  defaultPort;     /* default if config key missing */
 } net_port_msg_t;
 
 /* ---- ITS connect payload: net/web → task ---- */

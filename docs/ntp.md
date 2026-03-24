@@ -13,12 +13,12 @@ ntpStop();   // stop SNTP (call before network down)
 
 **Important**: `esp_sntp_setservername()` stores the pointer, not a copy. The server buffer is `static` to avoid dangling pointer.
 
-## NVS configuration
+## Configuration
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `ntp_server` | `pool.ntp.org` | NTP server hostname |
-| `ntp_tz` | `GMT0` | POSIX timezone string |
+| Config key | Default | Description |
+|------------|---------|-------------|
+| `s.ntp.server` | `pool.ntp.org` | NTP server hostname |
+| `s.ntp.tz` | `GMT0` | POSIX timezone string |
 
 Timezone uses POSIX TZ format, e.g.:
 - `GMT0` — UTC
@@ -30,7 +30,7 @@ DNS must be reachable for NTP to work.
 
 ## WiFi lifecycle
 
-`network_task.cpp` calls `ntpBegin()` on network up and `ntpStop()` on network down. On network down→up cycle, `ntpBegin()` is called again (re-inits SNTP with fresh config from NVS).
+`net.cpp` calls `ntpBegin()` on network up and `ntpStop()` on network down. On network down→up cycle, `ntpBegin()` is called again (re-inits SNTP with fresh config from storage).
 
 ## CLI
 
