@@ -499,7 +499,7 @@ void tlsReloadCert() {
 void tlsRegenCert() {
     /* EC key gen needs ~10KB stack — run on a temporary task */
     SemaphoreHandle_t sem = xSemaphoreCreateBinary();
-    xTaskCreatePinnedToCore(tlsRegenTask, "tls_gen", 16384, sem, 1, nullptr, 0);
+    xTaskCreatePinnedToCoreWithCaps(tlsRegenTask, "tls_gen", 16384, sem, 1, nullptr, 0, MALLOC_CAP_SPIRAM);
     xSemaphoreTake(sem, portMAX_DELAY);
     vSemaphoreDelete(sem);
 }

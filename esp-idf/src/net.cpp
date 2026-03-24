@@ -657,7 +657,7 @@ void netInit() {
   loadNetworks();
   readySem = xSemaphoreCreateBinary();
   wifiConnectedSem = xSemaphoreCreateBinary();
-  xTaskCreatePinnedToCore(netTaskFn, "net", 8192, nullptr, 2, &netHandle, 0);
+  xTaskCreatePinnedToCoreWithCaps(netTaskFn, "net", 8192, nullptr, 2, &netHandle, 0, MALLOC_CAP_SPIRAM);
   xSemaphoreTake(readySem, portMAX_DELAY);  /* wait until task is running */
 }
 
