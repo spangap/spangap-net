@@ -9,7 +9,6 @@
 #include "storage.h"
 #include "compat.h"
 #include "nvs_config.h"
-#include "ipc.h"
 #include "pm.h"
 #include "log.h"
 #include "cli.h"
@@ -39,8 +38,14 @@ static esp_netif_t* ap_netif = nullptr;
 static SemaphoreHandle_t wifiConnectedSem = nullptr;
 static volatile bool staConnected = false;
 static volatile bool wantDown = false;
+static volatile bool cmdUp = false;
+static volatile bool cmdForceDown = false;
 static volatile uint32_t lastActivityMs = 0;
 #define WIFI_IDLE_TIMEOUT_MS 30000
+
+/* ITS aux command interface */
+enum { NET_CMD_UP = 1, NET_CMD_DOWN, NET_CMD_FORCE_DOWN };
+#define NET_CMD_PORT 1
 
 /* Known STA networks loaded from config (s.wifi.1..9) */
 static struct {
@@ -495,7 +500,7 @@ static void doUp() {
   lastActivityMs = millis();
   epOpenAll();
   info("net up\n");
-  ipcBroadcast(MSG_NETWORK_IS_UP);
+  storageSet("net.up", 1);
   fireEvent(NET_EV_UP);
 }
 
@@ -505,7 +510,7 @@ static void doDown(wifi_state_t& state) {
   wantDown = false;
   fireEvent(NET_EV_DOWN);
   epCloseAll();
-  ipcBroadcast(MSG_NETWORK_DOWN);
+  storageSet("net.up", 0);
   delay(200);
   esp_wifi_disconnect();
   esp_wifi_stop();
@@ -515,10 +520,20 @@ static void doDown(wifi_state_t& state) {
   state = ST_OFF;
 }
 
+static void netCmdHandler(TaskHandle_t, uint16_t, const void* data, size_t len) {
+  if (len < 1) return;
+  uint8_t cmd = *(const uint8_t*)data;
+  switch (cmd) {
+    case NET_CMD_UP:         cmdUp = true; break;
+    case NET_CMD_DOWN:       wantDown = true; info("down requested\n"); break;
+    case NET_CMD_FORCE_DOWN: cmdForceDown = true; break;
+  }
+}
+
 static void netTaskFn(void* arg) {
-  ipcEnsureRegistered("net", 8);
   itsClientInit(NET_MAX_CLIENTS, netItsDisconnect);
   itsOnAux(netOnAux);
+  itsOnAux(netCmdHandler, NET_CMD_PORT);
 
   storageSubscribeChanges("s.", ON_CHANGE {
     if (!netIsUp()) return;
@@ -551,32 +566,34 @@ static void netTaskFn(void* arg) {
 
   for (;;) {
     bool connected = (state == ST_STA_CONNECTED || state == ST_AP);
-    ipc_msg_t msg;
-    for (bool first = true; ipcReceive(&msg, first && state == ST_OFF ? -1 : 0); first = false) {
-      if (msg.type == MSG_NETWORK_FORCE_DOWN && state != ST_OFF) {
-        doDown(state); wifiState = state; continue;
-      }
-      if (msg.type == MSG_NETWORK_DOWN && state != ST_OFF) {
-        wantDown = true; info("down requested\n"); continue;
-      }
-      if (msg.type == MSG_NETWORK_UP) {
-        if (wantDown) { wantDown = false; info("down cancelled\n"); }
-        if (state == ST_OFF) {
-          info("coming up\n");
-          rtcWifiUp = true;
-          loadNetworks();
-          setDhcpHostname();
-          wifiHwStart();
-          esp_wifi_set_mode(WIFI_MODE_STA);
-          state = ST_SCANNING;
-          scanStartMs = millis();
-          wifiState = state;
-        }
-        continue;
+
+    /* Sleep when off; otherwise just drain ITS inbox */
+    if (state == ST_OFF)
+      ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    while (itsPoll()) {}  /* aux commands + config change subscriptions */
+
+    /* Process command flags set by aux handler */
+    if (cmdForceDown && state != ST_OFF) {
+      cmdForceDown = false;
+      doDown(state); wifiState = state; continue;
+    }
+    cmdForceDown = false;
+
+    if (cmdUp) {
+      cmdUp = false;
+      if (wantDown) { wantDown = false; info("down cancelled\n"); }
+      if (state == ST_OFF) {
+        info("coming up\n");
+        rtcWifiUp = true;
+        loadNetworks();
+        setDhcpHostname();
+        wifiHwStart();
+        esp_wifi_set_mode(WIFI_MODE_STA);
+        state = ST_SCANNING;
+        scanStartMs = millis();
+        wifiState = state;
       }
     }
-    while (itsPoll()) {}  /* config change subscriptions */
-
     if (wantDown && connected) {
       if (millis() - lastActivityMs >= WIFI_IDLE_TIMEOUT_MS) {
         info("idle timeout, shutting down\n");
@@ -643,7 +660,7 @@ static void netTaskFn(void* arg) {
 static void netCliCmd(const char* args) {
     if (strcmp(args, "help") == 0) { cliPrintf("  %-*s WiFi control\n", CLI_HELP_COL, "net [up|down|down!]"); return; }
     if (strcmp(args, "up") == 0) netUp();
-    else if (strcmp(args, "down!") == 0) netForceDown();
+    else if (strcmp(args, "down!") == 0) netDown(true);
     else if (strcmp(args, "down") == 0) netDown();
     else cliPrintf("usage: net [up|down|down!]\n");
 }
@@ -670,15 +687,15 @@ void netInit() {
 }
 
 void netUp() {
-  if (netHandle) ipcSend(netHandle, MSG_NETWORK_UP);
+  if (!netHandle) return;
+  uint8_t cmd = NET_CMD_UP;
+  itsSendAuxByHandle(netHandle, &cmd, 1, pdMS_TO_TICKS(100), NET_CMD_PORT);
 }
 
-void netDown() {
-  if (netHandle) ipcSend(netHandle, MSG_NETWORK_DOWN);
-}
-
-void netForceDown() {
-  if (netHandle) ipcSend(netHandle, MSG_NETWORK_FORCE_DOWN);
+void netDown(bool force) {
+  if (!netHandle) return;
+  uint8_t cmd = force ? NET_CMD_FORCE_DOWN : NET_CMD_DOWN;
+  itsSendAuxByHandle(netHandle, &cmd, 1, pdMS_TO_TICKS(100), NET_CMD_PORT);
 }
 
 bool netIsUp() {

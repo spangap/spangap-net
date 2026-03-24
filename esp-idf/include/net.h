@@ -48,11 +48,8 @@ void netInit();
 /** Bring WiFi up (scan/connect). */
 void netUp();
 
-/** Bring WiFi down gracefully (waits for 30s idle). */
-void netDown();
-
-/** Bring WiFi down immediately. */
-void netForceDown();
+/** Bring WiFi down. force=false waits for 30s idle, force=true is immediate. */
+void netDown(bool force = false);
 
 /** Returns true if WiFi is connected (STA or AP). */
 bool netIsUp();
