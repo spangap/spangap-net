@@ -236,6 +236,12 @@ static void netPollOnce() {
             tls_conn_t* conn = tlsAccept(ep.serverFd);
             if (!conn) continue;
             int fd = tlsFd(conn);
+            if (ep.keepAlive) {
+                int yes = 1; setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+                int idle = 10; setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+                int intvl = 5; setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+                int cnt = 3;   setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+            }
             struct sockaddr_in sa = {};
             socklen_t sl = sizeof(sa);
             getpeername(fd, (struct sockaddr*)&sa, &sl);
@@ -246,7 +252,12 @@ static void netPollOnce() {
             int fd = accept(ep.serverFd, (struct sockaddr*)&peer, &peerLen);
             if (fd < 0) continue;
             if (ep.tcpNoDelay) { int yes = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes)); }
-            if (ep.keepAlive) { int yes = 1; setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes)); }
+            if (ep.keepAlive) {
+                int yes = 1; setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+                int idle = 10; setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+                int intvl = 5; setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+                int cnt = 3;   setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+            }
             fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
             netAcceptOne(ei, fd, nullptr, &peer);
         }
