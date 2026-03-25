@@ -216,7 +216,7 @@ static void netAcceptOne(int ei, int fd, tls_conn_t* conn, struct sockaddr_in* p
 
 /* Unified select on all server fds + client fds, then accept + proxy */
 static void netPollOnce() {
-    itsPoll();
+    while (itsPoll(0)) {}
     epOpenAll();
 
     fd_set rfds;
