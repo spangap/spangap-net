@@ -125,6 +125,10 @@ static net_udp_t netUdps[NET_MAX_UDP] = {};
 
 enum { NET_UDP_REGISTER = 10, NET_UDP_UNREGISTER };
 
+/* Shared ring buffer for incoming UDP packets */
+uint8_t netUdpRing[NET_UDP_RING_SIZE][NET_UDP_MTU];
+static int udpRingHead = 0;
+
 static net_endpoint_t* epFindByKey(const char* nvsKey) {
     for (int i = 0; i < netEpCount; i++)
         if (strcmp(netEps[i].nvsKey, nvsKey) == 0) return &netEps[i];
@@ -329,15 +333,17 @@ static void netPollOnce() {
     for (int i = 0; i < NET_MAX_UDP; i++) {
         auto& u = netUdps[i];
         if (u.fd < 0 || !FD_ISSET(u.fd, &rfds)) continue;
-        /* Read into netProxyBuf with room for header */
-        size_t hdrSize = offsetof(net_udp_packet_t, data);
-        auto* pkt = (net_udp_packet_t*)netProxyBuf;
-        socklen_t fromLen = sizeof(pkt->from);
-        int n = recvfrom(u.fd, pkt->data, 4096 - hdrSize, MSG_DONTWAIT,
-                         (struct sockaddr*)&pkt->from, &fromLen);
+        /* Read into ring buffer slot */
+        uint8_t slot = udpRingHead % NET_UDP_RING_SIZE;
+        struct sockaddr_in from = {};
+        socklen_t fromLen = sizeof(from);
+        int n = recvfrom(u.fd, netUdpRing[slot], NET_UDP_MTU, MSG_DONTWAIT,
+                         (struct sockaddr*)&from, &fromLen);
         if (n > 0) {
-            pkt->len = n;
-            itsSendAuxByHandle(u.task, pkt, hdrSize + n, 0, u.port);
+            udpRingHead++;
+            /* Send small notification — packet data stays in ring */
+            net_udp_packet_t pkt = { from, (uint16_t)n, slot };
+            itsSendAuxByHandle(u.task, &pkt, sizeof(pkt), 0, u.port);
         }
     }
 
@@ -601,7 +607,7 @@ static void netUdpHandler(TaskHandle_t sender, uint16_t port, const void* data, 
     for (int i = 0; i < NET_MAX_UDP; i++) {
       if (netUdps[i].fd < 0) {
         netUdps[i] = { fd, udpPort, sender };
-        dbg("net: UDP fd=%d port=%d → %s\n", fd, udpPort, pcTaskGetName(sender));
+        dbg("UDP fd=%d port=%d → %s\n", fd, udpPort, pcTaskGetName(sender));
         return;
       }
     }
