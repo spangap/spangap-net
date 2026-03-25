@@ -9,6 +9,7 @@
 
 #include <stddef.h>
 #include <lwip/ip_addr.h>
+#include <lwip/sockets.h>
 
 /* Compiler-define fallbacks for AP mode (survive factory reset) */
 #ifndef WIFI_AP_SSID
@@ -88,5 +89,24 @@ typedef struct {
 
 /** Force-close the TCP connection (RST). */
 void netForceClose(int itsHandle);
+
+/* ---- UDP socket management ---- */
+
+/** Incoming UDP packet delivered via ITS aux on the UDP port number.
+ *  Consumer registers itsOnAux handler for the port to receive these. */
+typedef struct {
+    struct sockaddr_in from;  /* source address */
+    uint16_t len;             /* packet length */
+    uint8_t data[];           /* packet data (flexible array) */
+} net_udp_packet_t;
+
+/** Create+bind a UDP socket, ask net to monitor it for incoming packets.
+ *  Incoming packets delivered as ITS aux (net_udp_packet_t) on the same
+ *  port number. Caller uses the returned fd for sendto() directly.
+ *  Returns fd, or -1 on failure. */
+int netUdpListen(uint16_t port);
+
+/** Stop monitoring and close a UDP socket. */
+void netUdpClose(int fd);
 
 #endif
