@@ -305,7 +305,9 @@ void tlsInit() {
     });
 }
 
-bool tlsReady() { return ready; }
+static volatile bool handshakeInProgress = false;
+
+bool tlsReady() { return ready && !handshakeInProgress; }
 
 tls_conn_t* tlsAccept(int serverFd) {
     if (!ready || serverFd < 0) return nullptr;
@@ -321,6 +323,7 @@ tls_conn_t* tlsAccept(int serverFd) {
     socklen_t len = sizeof(addr);
     int fd = accept(serverFd, (struct sockaddr*)&addr, &len);
     if (fd < 0) return nullptr;
+    handshakeInProgress = true;
 
     /* TCP_NODELAY for TLS handshake performance */
     int yes = 1;
@@ -332,7 +335,7 @@ tls_conn_t* tlsAccept(int serverFd) {
 
     /* Allocate connection in PSRAM */
     auto* conn = (tls_conn_t*)heap_caps_calloc(1, sizeof(tls_conn_t), MALLOC_CAP_SPIRAM);
-    if (!conn) { close(fd); return nullptr; }
+    if (!conn) { close(fd); handshakeInProgress = false; return nullptr; }
     conn->fd = fd;
 
     mbedtls_ssl_init(&conn->ssl);
@@ -342,6 +345,7 @@ tls_conn_t* tlsAccept(int serverFd) {
         mbedtls_ssl_free(&conn->ssl);
         heap_caps_free(conn);
         close(fd);
+        handshakeInProgress = false;
         return nullptr;
     }
 
@@ -383,6 +387,7 @@ tls_conn_t* tlsAccept(int serverFd) {
             mbedtls_ssl_free(&conn->ssl);
             heap_caps_free(conn);
             close(fd);
+            handshakeInProgress = false;
             return nullptr;
         }
     }
@@ -393,6 +398,7 @@ tls_conn_t* tlsAccept(int serverFd) {
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &no_tv, sizeof(no_tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &no_tv, sizeof(no_tv));
 
+    handshakeInProgress = false;
     return conn;
 }
 

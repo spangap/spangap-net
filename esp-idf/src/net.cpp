@@ -232,7 +232,18 @@ static void netPollOnce() {
         auto& ep = netEps[ei];
         if (ep.serverFd < 0 || !FD_ISSET(ep.serverFd, &rfds)) continue;
         if (ep.tls) {
-            if (!tlsReady()) continue;
+            if (!tlsReady()) {
+                /* Refuse connection with RST so browser backs off fast */
+                struct sockaddr_in addr;
+                socklen_t alen = sizeof(addr);
+                int reject = accept(ep.serverFd, (struct sockaddr*)&addr, &alen);
+                if (reject >= 0) {
+                    struct linger lo = {1, 0};
+                    setsockopt(reject, SOL_SOCKET, SO_LINGER, &lo, sizeof(lo));
+                    close(reject);
+                }
+                continue;
+            }
             tls_conn_t* conn = tlsAccept(ep.serverFd);
             if (!conn) continue;
             int fd = tlsFd(conn);
