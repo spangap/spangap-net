@@ -92,28 +92,4 @@ void netForceClose(int itsHandle);
 
 /* ---- UDP socket management ---- */
 
-/** Incoming UDP packet notification delivered via ITS aux on the UDP port number.
- *  Packet data is in a shared ring buffer — read it in the handler, it may be
- *  overwritten by the next packet. */
-#define NET_UDP_RING_SIZE  8
-#define NET_UDP_MTU        1500
-
-typedef struct {
-    struct sockaddr_in from;  /* source address */
-    uint16_t len;             /* packet length */
-    uint8_t  slot;            /* ring buffer slot index */
-} net_udp_packet_t;
-
-/** Ring buffer for incoming UDP packets (read-only for consumers). */
-extern uint8_t netUdpRing[NET_UDP_RING_SIZE][NET_UDP_MTU];
-
-/** Create+bind a UDP socket, ask net to monitor it for incoming packets.
- *  Incoming packets delivered as ITS aux (net_udp_packet_t) on the same
- *  port number. Caller uses the returned fd for sendto() directly.
- *  Returns fd, or -1 on failure. */
-int netUdpListen(uint16_t port);
-
-/** Stop monitoring and close a UDP socket. */
-void netUdpClose(int fd);
-
 #endif

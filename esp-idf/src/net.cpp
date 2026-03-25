@@ -111,23 +111,6 @@ static int netEpCount = 0;
 static net_client_t netClients[NET_MAX_CLIENTS];
 static uint8_t* netProxyBuf;  /* 4096 bytes, PSRAM */
 
-/* ---- UDP monitoring ---- */
-
-#define NET_MAX_UDP 4
-
-struct net_udp_t {
-    int fd;
-    uint16_t port;           /* UDP port number = ITS aux port */
-    TaskHandle_t task;       /* deliver packets to this task */
-};
-
-static net_udp_t netUdps[NET_MAX_UDP] = {};
-
-enum { NET_UDP_REGISTER = 10, NET_UDP_UNREGISTER };
-
-/* Shared ring buffer for incoming UDP packets */
-uint8_t netUdpRing[NET_UDP_RING_SIZE][NET_UDP_MTU];
-static int udpRingHead = 0;
 
 static net_endpoint_t* epFindByKey(const char* nvsKey) {
     for (int i = 0; i < netEpCount; i++)
@@ -237,12 +220,6 @@ static void netPollOnce() {
             if (netClients[i].fd > maxFd) maxFd = netClients[i].fd;
         }
     }
-    for (int i = 0; i < NET_MAX_UDP; i++) {
-        if (netUdps[i].fd >= 0) {
-            FD_SET(netUdps[i].fd, &rfds);
-            if (netUdps[i].fd > maxFd) maxFd = netUdps[i].fd;
-        }
-    }
 
     if (maxFd >= 0) {
         struct timeval tv = { 0, 10000 };
@@ -329,23 +306,6 @@ static void netPollOnce() {
         nextClient:;
     }
 
-    /* Forward incoming UDP packets to registered tasks */
-    for (int i = 0; i < NET_MAX_UDP; i++) {
-        auto& u = netUdps[i];
-        if (u.fd < 0 || !FD_ISSET(u.fd, &rfds)) continue;
-        /* Read into ring buffer slot */
-        uint8_t slot = udpRingHead % NET_UDP_RING_SIZE;
-        struct sockaddr_in from = {};
-        socklen_t fromLen = sizeof(from);
-        int n = recvfrom(u.fd, netUdpRing[slot], NET_UDP_MTU, MSG_DONTWAIT,
-                         (struct sockaddr*)&from, &fromLen);
-        if (n > 0) {
-            udpRingHead++;
-            /* Send small notification — packet data stays in ring */
-            net_udp_packet_t pkt = { from, (uint16_t)n, slot };
-            itsSendAuxByHandle(u.task, &pkt, sizeof(pkt), 0, u.port);
-        }
-    }
 
     fireEvent(NET_EV_POLL);
 }
@@ -594,46 +554,11 @@ static void netCmdHandler(TaskHandle_t, uint16_t, const void* data, size_t len) 
   }
 }
 
-#define NET_UDP_PORT 25
-
-static void netUdpHandler(TaskHandle_t sender, uint16_t port, const void* data, size_t len) {
-  if (len < 1) return;
-  uint8_t cmd = *(const uint8_t*)data;
-  if (cmd == NET_UDP_REGISTER && len >= 1 + sizeof(int) + sizeof(uint16_t)) {
-    int fd;
-    uint16_t udpPort;
-    memcpy(&fd, (const uint8_t*)data + 1, sizeof(fd));
-    memcpy(&udpPort, (const uint8_t*)data + 1 + sizeof(fd), sizeof(udpPort));
-    for (int i = 0; i < NET_MAX_UDP; i++) {
-      if (netUdps[i].fd < 0) {
-        netUdps[i] = { fd, udpPort, sender };
-        dbg("UDP fd=%d port=%d → %s\n", fd, udpPort, pcTaskGetName(sender));
-        return;
-      }
-    }
-    err("net: no free UDP slot\n");
-  } else if (cmd == NET_UDP_UNREGISTER && len >= 1 + sizeof(int)) {
-    int fd;
-    memcpy(&fd, (const uint8_t*)data + 1, sizeof(fd));
-    for (int i = 0; i < NET_MAX_UDP; i++) {
-      if (netUdps[i].fd == fd) {
-        close(fd);
-        netUdps[i] = { -1, 0, nullptr };
-        dbg("net: UDP fd=%d closed\n", fd);
-        return;
-      }
-    }
-  }
-}
 
 static void netTaskFn(void* arg) {
   itsClientInit(NET_MAX_CLIENTS, netItsDisconnect);
   itsOnAux(netOnAux);
   itsOnAux(netCmdHandler, NET_CMD_PORT);
-  itsOnAux(netUdpHandler, NET_UDP_PORT);
-
-  /* Init UDP slots */
-  for (int i = 0; i < NET_MAX_UDP; i++) netUdps[i].fd = -1;
 
   storageSubscribeChanges("s.", ON_CHANGE {
     if (!netIsUp()) return;
@@ -822,39 +747,3 @@ void netForceClose(int itsHandle) {
     netClientClose(*c);
 }
 
-/* ---- UDP socket management ---- */
-
-int netUdpListen(uint16_t port) {
-    int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (fd < 0) return -1;
-
-    struct sockaddr_in addr = {};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    addr.sin_addr.s_addr = INADDR_ANY;
-
-    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        close(fd);
-        return -1;
-    }
-
-    /* Non-blocking for sendto from caller */
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
-
-    /* Tell net task to monitor this fd */
-    uint8_t buf[1 + sizeof(int) + sizeof(uint16_t)];
-    buf[0] = NET_UDP_REGISTER;
-    memcpy(buf + 1, &fd, sizeof(fd));
-    memcpy(buf + 1 + sizeof(fd), &port, sizeof(port));
-    itsSendAux("net", buf, sizeof(buf), pdMS_TO_TICKS(500), NET_UDP_PORT);
-
-    return fd;
-}
-
-void netUdpClose(int fd) {
-    if (fd < 0) return;
-    uint8_t buf[1 + sizeof(int)];
-    buf[0] = NET_UDP_UNREGISTER;
-    memcpy(buf + 1, &fd, sizeof(fd));
-    itsSendAux("net", buf, sizeof(buf), pdMS_TO_TICKS(500), NET_UDP_PORT);
-}
