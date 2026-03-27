@@ -41,6 +41,9 @@ static volatile bool wantDown = false;
 static volatile bool cmdUp = false;
 static volatile bool cmdForceDown = false;
 static volatile uint32_t lastActivityMs = 0;
+static uint32_t connectTimeMs = 0;
+static uint32_t trafficIn = 0;
+static uint32_t trafficOut = 0;
 #define WIFI_IDLE_TIMEOUT_MS 30000
 
 /* ITS aux command interface */
@@ -287,12 +290,13 @@ static void netPollOnce() {
             int n = c.tlsConn ? tlsRead(c.tlsConn, netProxyBuf, 4096)
                               : recv(c.fd, netProxyBuf, 4096, MSG_DONTWAIT);
             if (c.tlsConn ? (n < 0) : (n == 0)) { netClientClose(c); continue; }
-            if (n > 0) { itsSend(c.itsHandle, netProxyBuf, n, 0); netActivity(); }
+            if (n > 0) { itsSend(c.itsHandle, netProxyBuf, n, 0); netActivity(); trafficIn += n; }
         }
 
         for (int rounds = 0; rounds < 4; rounds++) {
             size_t n = itsRecv(c.itsHandle, netProxyBuf, 4096, 0);
             if (n == 0) break;
+            trafficOut += n;
             const uint8_t* p = netProxyBuf;
             size_t rem = n;
             while (rem > 0) {
@@ -521,6 +525,8 @@ static volatile wifi_state_t wifiState = ST_OFF;
 
 static void doUp() {
   esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+  connectTimeMs = millis();
+  trafficIn = trafficOut = 0;
   lastActivityMs = millis();
   epOpenAll();
   info("net up\n");
@@ -682,11 +688,62 @@ static void netTaskFn(void* arg) {
 /* ---- Public API ---- */
 
 static void netCliCmd(const char* args) {
-    if (strcmp(args, "help") == 0) { cliPrintf("  %-*s WiFi control\n", CLI_HELP_COL, "net [up|down|down!]"); return; }
-    if (strcmp(args, "up") == 0) netUp();
-    else if (strcmp(args, "down!") == 0) netDown(true);
-    else if (strcmp(args, "down") == 0) netDown();
-    else cliPrintf("usage: net [up|down|down!]\n");
+    if (strcmp(args, "help") == 0) { cliPrintf("  %-*s WiFi control / status\n", CLI_HELP_COL, "net [up|down|down!]"); return; }
+    if (strcmp(args, "up") == 0) { netUp(); return; }
+    if (strcmp(args, "down!") == 0) { netDown(true); return; }
+    if (strcmp(args, "down") == 0) { netDown(); return; }
+    if (*args) { cliPrintf("usage: net [up|down|down!]\n"); return; }
+
+    /* Show status */
+    if (wifiState == ST_OFF) { cliPrintf("wifi is down\n"); return; }
+    if (wifiState == ST_SCANNING) { cliPrintf("wifi is connecting...\n"); return; }
+
+    uint32_t upSecs = (millis() - connectTimeMs) / 1000;
+    char elapsed[32];
+    fmtElapsed(upSecs, elapsed, sizeof(elapsed));
+
+    if (wifiState == ST_AP) {
+        cliPrintf("wifi is up (AP) - %s\n\n", elapsed);
+        char ssid[33];
+        storageGetStr("s.wifi.0.ssid", ssid, sizeof(ssid), WIFI_AP_SSID);
+        esp_netif_ip_info_t ip_info;
+        esp_netif_get_ip_info(ap_netif, &ip_info);
+        char ip[16], mask[16];
+        esp_ip4addr_ntoa(&ip_info.ip, ip, sizeof(ip));
+        esp_ip4addr_ntoa(&ip_info.netmask, mask, sizeof(mask));
+        cliPrintf("  SSID:    %s\n", ssid);
+        cliPrintf("  IP:      %s\n", ip);
+        cliPrintf("  netmask: %s\n", mask);
+    } else {
+        cliPrintf("wifi is up - %s\n\n", elapsed);
+        wifi_ap_record_t ap_info;
+        const char* ssid = "?";
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) ssid = (const char*)ap_info.ssid;
+        esp_netif_ip_info_t ip_info;
+        esp_netif_get_ip_info(sta_netif, &ip_info);
+        char ip[16], gw[16], mask[16];
+        esp_ip4addr_ntoa(&ip_info.ip, ip, sizeof(ip));
+        esp_ip4addr_ntoa(&ip_info.gw, gw, sizeof(gw));
+        esp_ip4addr_ntoa(&ip_info.netmask, mask, sizeof(mask));
+        esp_netif_dns_info_t dns1 = {}, dns2 = {};
+        char dns1s[16], dns2s[16];
+        esp_netif_get_dns_info(sta_netif, ESP_NETIF_DNS_MAIN, &dns1);
+        esp_ip4addr_ntoa(&dns1.ip.u_addr.ip4, dns1s, sizeof(dns1s));
+        esp_netif_get_dns_info(sta_netif, ESP_NETIF_DNS_BACKUP, &dns2);
+        esp_ip4addr_ntoa(&dns2.ip.u_addr.ip4, dns2s, sizeof(dns2s));
+        cliPrintf("  SSID:    %s\n", ssid);
+        cliPrintf("  IP:      %s\n", ip);
+        cliPrintf("  router:  %s\n", gw);
+        cliPrintf("  netmask: %s\n", mask);
+        if (strcmp(dns2s, "0.0.0.0") != 0)
+            cliPrintf("  DNS:     %s, %s\n", dns1s, dns2s);
+        else
+            cliPrintf("  DNS:     %s\n", dns1s);
+    }
+    char inBuf[16], outBuf[16];
+    fmtSize(trafficIn, inBuf, sizeof(inBuf));
+    fmtSize(trafficOut, outBuf, sizeof(outBuf));
+    cliPrintf("  traffic: in %s, out %s\n", inBuf, outBuf);
 }
 
 void netInit() {
@@ -729,6 +786,9 @@ bool netIsUp() {
 void netActivity() {
   lastActivityMs = millis();
 }
+
+void netTrafficIn(uint32_t bytes) { trafficIn += bytes; }
+void netTrafficOut(uint32_t bytes) { trafficOut += bytes; }
 
 void netGetLocalIp(char* out, size_t len) {
   if (!sta_netif || !staConnected) { out[0] = '\0'; return; }

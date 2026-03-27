@@ -58,6 +58,11 @@ bool netIsUp();
 /** Signal network activity (resets idle timer for graceful shutdown). */
 void netActivity();
 
+/** Accumulate traffic counters (bytes). Only for tasks with their own sockets
+ *  (e.g. webrtc UDP) — TCP traffic through net's proxy is counted automatically. */
+void netTrafficIn(uint32_t bytes);
+void netTrafficOut(uint32_t bytes);
+
 /** Get the local STA IP address. Returns "" if not connected. */
 void netGetLocalIp(char* out, size_t len);
 
