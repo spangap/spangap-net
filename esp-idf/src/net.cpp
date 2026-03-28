@@ -135,7 +135,7 @@ static void netOnAux(TaskHandle_t sender, uint16_t port, const void* data, size_
     }
     ep->task = sender;
     ep->itsPort = msg->itsPort;
-    strncpy(ep->nvsKey, msg->nvsKey, sizeof(ep->nvsKey) - 1);
+    safeStrncpy(ep->nvsKey, msg->nvsKey, sizeof(ep->nvsKey));
     ep->defaultPort = msg->defaultPort;
     ep->tls = msg->tls;
     ep->tcpNoDelay = true;
