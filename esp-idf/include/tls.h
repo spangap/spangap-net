@@ -20,7 +20,7 @@
  */
 typedef struct tls_conn tls_conn_t;
 
-/** Initialize TLS subsystem.  Call once from app_main after storageLoad + nvsRunBoot.
+/** Initialize TLS subsystem.  Call once from app_main after storageLoad.
  *  Generates cert if needed (may take ~2 s for EC P-256). */
 void tlsInit();
 

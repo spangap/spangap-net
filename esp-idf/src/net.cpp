@@ -8,7 +8,6 @@
 #include "net.h"
 #include "storage.h"
 #include "compat.h"
-#include "nvs_config.h"
 #include "pm.h"
 #include "log.h"
 #include "cli.h"
@@ -757,7 +756,7 @@ void netInit() {
   }
   netProxyBuf = (uint8_t*)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
 
-  if (!rtcValid())
+  if (!rtcRamValid())
     rtcWifiUp = storageGetInt("s.wifi.enable", 1) != 0;
 
   loadNetworks();
