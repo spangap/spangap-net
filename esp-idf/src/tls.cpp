@@ -247,6 +247,8 @@ static bool loadAndConfigure() {
 
 /* ---- Public API ---- */
 
+static void tlsRegenCert();
+
 static bool anySslPort() {
     return storageGetInt("s.net.https_port", 443) > 0;
 }
@@ -298,9 +300,66 @@ void tlsInit() {
         ready = true;
         info("TLS ready\n");
     }
-    cliRegisterCmd("tls keygen", [](const char* a) {
-        if (strcmp(a, "help") == 0) { cliPrintf("  %-*s regenerate TLS certificate\n", CLI_HELP_COL, "tls keygen"); return; }
+
+    /* cert CLI commands */
+    cliRegisterCmd("cert self-signed", [](const char* a) {
+        if (strcmp(a, "help") == 0) { cliPrintf("  %-*s generate self-signed cert (if none exists)\n", CLI_HELP_COL, "cert self-signed"); return; }
+        std::string existing;
+        if (stateRead("tls_cert", existing)) { cliPrintf("  certificate already exists\n"); return; }
         tlsRegenCert();
+    });
+    cliRegisterCmd("cert delete", [](const char* a) {
+        if (strcmp(a, "help") == 0) { cliPrintf("  %-*s delete TLS certificate\n", CLI_HELP_COL, "cert delete"); return; }
+        remove("/state/tls_cert.pem");
+        remove("/state/tls_key.pem");
+        if (ready) {
+            mbedtls_x509_crt_free(&srvcert);
+            mbedtls_pk_free(&pkey);
+            mbedtls_ssl_config_free(&conf);
+            mbedtls_x509_crt_init(&srvcert);
+            mbedtls_pk_init(&pkey);
+            mbedtls_ssl_config_init(&conf);
+            ready = false;
+        }
+        cliPrintf("  certificate deleted\n");
+    });
+    cliRegisterCmd("cert", [](const char* a) {
+        if (strcmp(a, "help") == 0) {
+            cliPrintf("  %-*s show certificate info\n", CLI_HELP_COL, "cert");
+            cliPrintf("  %-*s generate self-signed cert\n", CLI_HELP_COL, "cert self-signed");
+            cliPrintf("  %-*s delete certificate\n", CLI_HELP_COL, "cert delete");
+            cliPrintf("  %-*s get/renew ACME cert\n", CLI_HELP_COL, "cert acme [days]");
+            return;
+        }
+        std::string certPem;
+        if (!stateRead("tls_cert", certPem)) { cliPrintf("  no TLS certificate\n"); return; }
+        mbedtls_x509_crt crt;
+        mbedtls_x509_crt_init(&crt);
+        if (mbedtls_x509_crt_parse(&crt, (const uint8_t*)certPem.c_str(), certPem.size()) != 0) {
+            cliPrintf("  certificate parse error\n");
+            mbedtls_x509_crt_free(&crt);
+            return;
+        }
+        char buf[256];
+        mbedtls_x509_dn_gets(buf, sizeof(buf), &crt.issuer);
+        cliPrintf("  issuer:  %s\n", buf);
+        mbedtls_x509_dn_gets(buf, sizeof(buf), &crt.subject);
+        cliPrintf("  subject: %s\n", buf);
+        cliPrintf("  expires: %04d-%02d-%02d\n",
+                  crt.valid_to.year, crt.valid_to.mon, crt.valid_to.day);
+        time_t now = time(nullptr);
+        if (now > 1735689600) {
+            struct tm expiry = {};
+            expiry.tm_year = crt.valid_to.year - 1900;
+            expiry.tm_mon = crt.valid_to.mon - 1;
+            expiry.tm_mday = crt.valid_to.day;
+            time_t expiryTime = mktime(&expiry);
+            cliPrintf("  days left: %d\n", (int)((expiryTime - now) / 86400));
+        }
+        bool selfSigned = (crt.issuer_raw.len == crt.subject_raw.len &&
+                           memcmp(crt.issuer_raw.p, crt.subject_raw.p, crt.issuer_raw.len) == 0);
+        cliPrintf("  type: %s\n", selfSigned ? "self-signed" : "CA-signed");
+        mbedtls_x509_crt_free(&crt);
     });
 }
 
@@ -501,7 +560,7 @@ void tlsReloadCert() {
     }
 }
 
-void tlsRegenCert() {
+static void tlsRegenCert() {
     /* EC key gen needs ~10KB stack — run on a temporary task */
     SemaphoreHandle_t sem = xSemaphoreCreateBinary();
     xTaskCreatePinnedToCoreWithCaps(tlsRegenTask, "tls_gen", 16384, sem, 1, nullptr, 0, MALLOC_CAP_DEFAULT);

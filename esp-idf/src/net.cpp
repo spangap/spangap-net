@@ -36,8 +36,8 @@ static esp_netif_t* ap_netif = nullptr;
 /* Event-driven connection signaling */
 static SemaphoreHandle_t wifiConnectedSem = nullptr;
 static volatile bool staConnected = false;
-static volatile bool wantDown = false;
 static volatile bool cmdUp = false;
+static volatile bool cmdDown = false;
 static volatile bool cmdForceDown = false;
 static volatile uint32_t lastActivityMs = 0;
 static uint32_t connectTimeMs = 0;
@@ -49,6 +49,11 @@ static uint32_t trafficOut = 0;
 enum { NET_CMD_UP = 1, NET_CMD_DOWN, NET_CMD_FORCE_DOWN };
 #define NET_CMD_PORT 1
 
+/* RTC state: survives deep sleep. On cold boot, boot file runs "net up". */
+RTC_DATA_ATTR static bool rtcWantUp = false;
+
+static bool wantUp() { return rtcWantUp; }
+
 /* Known STA networks loaded from config (s.wifi.1..9) */
 static struct {
   char ssid[33];
@@ -56,9 +61,6 @@ static struct {
   char ip[16], gw[16], mask[16], dns[16];
 } staNet[MAX_STA_NETWORKS];
 static int staCount = 0;
-
-/* RTC state: survives deep sleep so wifi stays down after cron "net down" */
-RTC_DATA_ATTR static bool rtcWifiUp = true;
 
 static pm_lock_handle_t netDeepLock = nullptr;
 
@@ -535,8 +537,6 @@ static void doUp() {
 
 static void doDown(wifi_state_t& state) {
   info("shutting down\n");
-  rtcWifiUp = false;
-  wantDown = false;
   fireEvent(NET_EV_DOWN);
   epCloseAll();
   storageSet("net.up", 0);
@@ -544,9 +544,8 @@ static void doDown(wifi_state_t& state) {
   esp_wifi_disconnect();
   esp_wifi_stop();
   esp_wifi_deinit();
-  if (state == ST_STA_CONNECTED || state == ST_AP)
-    pmLockRelease(netDeepLock);
   state = ST_OFF;
+  pmLockRelease(netDeepLock);
 }
 
 static void netCmdHandler(TaskHandle_t, uint16_t, const void* data, size_t len) {
@@ -554,7 +553,7 @@ static void netCmdHandler(TaskHandle_t, uint16_t, const void* data, size_t len) 
   uint8_t cmd = *(const uint8_t*)data;
   switch (cmd) {
     case NET_CMD_UP:         cmdUp = true; break;
-    case NET_CMD_DOWN:       wantDown = true; info("down requested\n"); break;
+    case NET_CMD_DOWN:       cmdDown = true; break;
     case NET_CMD_FORCE_DOWN: cmdForceDown = true; break;
   }
 }
@@ -581,17 +580,16 @@ static void netTaskFn(void* arg) {
   uint32_t lastApRetryMs = 0;
   const uint32_t AP_RETRY_MS = 5 * 60 * 1000;
 
-  if (rtcWifiUp) {
+  if (wantUp()) {
+    pmLockAcquire(netDeepLock);
     setDhcpHostname();
     wifiHwStart();
     esp_wifi_set_mode(WIFI_MODE_STA);
     state = ST_SCANNING;
     if (staCount == 0) {
-      if (startAP()) { state = ST_AP; pmLockAcquire(netDeepLock); }
-      else state = ST_OFF;
+      if (startAP()) { state = ST_AP; }
+      else { state = ST_OFF; pmLockRelease(netDeepLock); }
     }
-  } else {
-    info("wifi disabled\n");
   }
 
   for (;;) {
@@ -602,18 +600,19 @@ static void netTaskFn(void* arg) {
       while (itsPoll(t)) { t = 0; } }
 
     /* Process command flags set by aux handler */
-    if (cmdForceDown && state != ST_OFF) {
+    if (cmdForceDown) {
       cmdForceDown = false;
-      doDown(state); wifiState = state; continue;
+      rtcWantUp = false;
+      if (state != ST_OFF) { doDown(state); wifiState = state; }
+      continue;
     }
-    cmdForceDown = false;
 
     if (cmdUp) {
       cmdUp = false;
-      if (wantDown) { wantDown = false; info("down cancelled\n"); }
+      rtcWantUp = true;
       if (state == ST_OFF) {
         info("coming up\n");
-        rtcWifiUp = true;
+        pmLockAcquire(netDeepLock);
         loadNetworks();
         setDhcpHostname();
         wifiHwStart();
@@ -623,9 +622,21 @@ static void netTaskFn(void* arg) {
         wifiState = state;
       }
     }
-    if (wantDown && connected) {
+
+    if (cmdDown) {
+      cmdDown = false;
+      rtcWantUp = false;
+      if (connected) {
+        info("going down (waiting for idle)\n");
+      } else if (state == ST_SCANNING) {
+        doDown(state); wifiState = state; continue;
+      }
+    }
+
+    /* Graceful shutdown: want_up=0 + connected → wait for idle */
+    if (!wantUp() && connected) {
       if (millis() - lastActivityMs >= WIFI_IDLE_TIMEOUT_MS) {
-        info("idle timeout, shutting down\n");
+        info("idle, shutting down\n");
         doDown(state); wifiState = state; continue;
       }
     }
@@ -636,11 +647,10 @@ static void netTaskFn(void* arg) {
         int idx = scanForKnown();
         if (idx >= 0 && connectSta(idx)) {
           state = ST_STA_CONNECTED;
-          pmLockAcquire(netDeepLock);
           doUp();
         } else if (millis() - scanStartMs >= (uint32_t)(searchTimeout * 1000)) {
-          if (startAP()) { state = ST_AP; pmLockAcquire(netDeepLock); doUp(); }
-          else state = ST_OFF;
+          if (startAP()) { state = ST_AP; doUp(); }
+          else { state = ST_OFF; pmLockRelease(netDeepLock); }
         } else {
           delay(2000);
         }
@@ -653,28 +663,25 @@ static void netTaskFn(void* arg) {
           fireEvent(NET_EV_DOWN);
           epCloseAll();
           esp_wifi_disconnect();
-          pmLockRelease(netDeepLock);
+          /* Keep PM lock — still want_up, will reconnect */
           state = ST_SCANNING;
           scanStartMs = millis();
         }
         break;
       case ST_AP:
         netPollOnce();
-        if (staCount > 0 && !wantDown && millis() - lastApRetryMs >= AP_RETRY_MS) {
+        if (staCount > 0 && wantUp() && millis() - lastApRetryMs >= AP_RETRY_MS) {
           lastApRetryMs = millis();
           fireEvent(NET_EV_DOWN);
           epCloseAll();
-          pmLockRelease(netDeepLock);
           esp_wifi_set_mode(WIFI_MODE_STA);
           delay(100);
           int idx = scanForKnown();
           if (idx >= 0 && connectSta(idx)) {
             state = ST_STA_CONNECTED;
-            pmLockAcquire(netDeepLock);
             doUp();
           } else {
             startAP();
-            pmLockAcquire(netDeepLock);
             doUp();
           }
         }
@@ -693,16 +700,17 @@ static void netCliCmd(const char* args) {
     if (strcmp(args, "down") == 0) { netDown(); return; }
     if (*args) { cliPrintf("usage: net [up|down|down!]\n"); return; }
 
-    /* Show status */
-    if (wifiState == ST_OFF) { cliPrintf("wifi is down\n"); return; }
-    if (wifiState == ST_SCANNING) { cliPrintf("wifi is connecting...\n"); return; }
+    /* Show status — four states: down, connecting, up, going down */
+    if (wifiState == ST_OFF) { cliPrintf("wifi: down\n"); return; }
+    if (wifiState == ST_SCANNING) { cliPrintf("wifi: connecting\n"); return; }
+    bool goingDown = !wantUp();
 
     uint32_t upSecs = (millis() - connectTimeMs) / 1000;
     char elapsed[32];
     fmtElapsed(upSecs, elapsed, sizeof(elapsed));
 
     if (wifiState == ST_AP) {
-        cliPrintf("wifi is up (AP) - %s\n\n", elapsed);
+        cliPrintf("wifi: %s (AP) - %s\n\n", goingDown ? "going down" : "up", elapsed);
         char ssid[33];
         storageGetStr("s.wifi.0.ssid", ssid, sizeof(ssid), WIFI_AP_SSID);
         esp_netif_ip_info_t ip_info;
@@ -714,7 +722,7 @@ static void netCliCmd(const char* args) {
         cliPrintf("  IP:      %s\n", ip);
         cliPrintf("  netmask: %s\n", mask);
     } else {
-        cliPrintf("wifi is up - %s\n\n", elapsed);
+        cliPrintf("wifi: %s - %s\n\n", goingDown ? "going down" : "up", elapsed);
         wifi_ap_record_t ap_info;
         const char* ssid = "?";
         if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) ssid = (const char*)ap_info.ssid;
@@ -756,8 +764,8 @@ void netInit() {
   }
   netProxyBuf = (uint8_t*)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
 
-  if (!rtcRamValid())
-    rtcWifiUp = storageGetInt("s.wifi.enable", 1) != 0;
+  /* Cold boot: default to up. Deep sleep wake: preserve previous state. */
+  if (!rtcRamValid()) rtcWantUp = true;
 
   loadNetworks();
   readySem = xSemaphoreCreateBinary();
@@ -767,12 +775,14 @@ void netInit() {
 }
 
 void netUp() {
-  if (!netHandle) return;
+  rtcWantUp = true;
+  if (!netHandle) return;  /* net task will pick up rtcWantUp on start */
   uint8_t cmd = NET_CMD_UP;
   itsSendAuxByHandle(netHandle, &cmd, 1, pdMS_TO_TICKS(100), NET_CMD_PORT);
 }
 
 void netDown(bool force) {
+  rtcWantUp = false;
   if (!netHandle) return;
   uint8_t cmd = force ? NET_CMD_FORCE_DOWN : NET_CMD_DOWN;
   itsSendAuxByHandle(netHandle, &cmd, 1, pdMS_TO_TICKS(100), NET_CMD_PORT);

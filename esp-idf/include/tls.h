@@ -49,10 +49,6 @@ void tlsClose(tls_conn_t*& conn);
 /** Returns number of bytes buffered in TLS layer (not yet read by app). */
 size_t tlsBytesAvail(tls_conn_t* conn);
 
-/** Force-regenerate the certificate (e.g. after hostname change).
- *  Call from CLI context — blocks for ~2s. */
-void tlsRegenCert();
-
 /** Reload cert + key from /state/ (after ACME renewal). */
 void tlsReloadCert();
 
