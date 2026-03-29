@@ -23,6 +23,17 @@
 #include <cstring>
 #include <cstdio>
 #include "esp_heap_caps.h"
+#include "esp_random.h"
+#include <cerrno>
+#include <cctype>
+#include <cstdlib>
+#include <memory>
+#include <sys/time.h>
+#include "lwip/inet.h"
+#include "lwip/inet_chksum.h"
+#include "lwip/prot/icmp.h"
+#include "lwip/prot/ip.h"
+#include "lwip/prot/ip4.h"
 
 #define MAX_STA_NETWORKS 9
 
@@ -691,6 +702,162 @@ static void netTaskFn(void* arg) {
   }
 }
 
+/* ---- ICMP ping (CLI) — raw socket on caller task; avoids esp_ping extra task (often ESP_ERR_NO_MEM / 257) ---- */
+
+static int pingRecvEchoReply(int sock, uint16_t wantId, uint16_t wantSeq, uint8_t* ttlOut, uint32_t* payloadOut) {
+    char buf[128];
+    for (;;) {
+        struct sockaddr_storage from{};
+        socklen_t fromlen = sizeof(from);
+        int len = recvfrom(sock, buf, sizeof(buf), 0, reinterpret_cast<struct sockaddr*>(&from), &fromlen);
+        if (len <= 0) return len;
+        if (from.ss_family != AF_INET) continue;
+        if (len < (int)sizeof(struct ip_hdr)) continue;
+        struct ip_hdr* iphdr = reinterpret_cast<struct ip_hdr*>(buf);
+        int iphLen = IPH_HL_BYTES(iphdr);
+        if (len < iphLen + (int)sizeof(struct icmp_echo_hdr)) continue;
+        auto* iecho = reinterpret_cast<struct icmp_echo_hdr*>(buf + iphLen);
+        if (iecho->type != ICMP_ER) continue;
+        if (iecho->id != wantId || iecho->seqno != wantSeq) continue;
+        *ttlOut = IPH_TTL(iphdr);
+        *payloadOut = (uint32_t)(lwip_ntohs(IPH_LEN(iphdr)) - (uint16_t)iphLen - sizeof(struct icmp_echo_hdr));
+        return len;
+    }
+}
+
+static void pingCliCmd(const char* args) {
+    if (strcmp(args, "help") == 0) {
+        cliPrintf("  %-*s ICMP echo (default target=router, count=4)\n", CLI_HELP_COL, "ping [ip] [count]");
+        return;
+    }
+    if (!netIsUp()) {
+        cliPrintf("ping: no network\n");
+        return;
+    }
+
+    esp_netif_t* nif = (wifiState == ST_AP) ? ap_netif : sta_netif;
+    if (!nif) {
+        cliPrintf("ping: no interface\n");
+        return;
+    }
+
+    ip_addr_t target{};
+    uint32_t count = 4;
+
+    while (*args == ' ' || *args == '\t') args++;
+    if (!*args) {
+        esp_netif_ip_info_t ipi{};
+        if (esp_netif_get_ip_info(nif, &ipi) != ESP_OK || ipi.gw.addr == 0) {
+            cliPrintf("ping: no gateway\n");
+            return;
+        }
+        ip_addr_set_ip4_u32_val(target, ipi.gw.addr);
+    } else {
+        char host[48];
+        const char* p = args;
+        const char* q = p;
+        while (*q && !std::isspace((unsigned char)*q)) q++;
+        size_t len = (size_t)(q - p);
+        if (len >= sizeof(host)) {
+            cliPrintf("ping: address too long\n");
+            return;
+        }
+        memcpy(host, p, len);
+        host[len] = '\0';
+        while (*q == ' ' || *q == '\t') q++;
+        if (*q) {
+            char* end = nullptr;
+            unsigned long c = std::strtoul(q, &end, 10);
+            if (end != q && c > 0 && c <= 32) count = (uint32_t)c;
+            else cliPrintf("ping: bad count, using 4\n");
+        }
+        uint32_t raw = ipaddr_addr(host);
+        if (raw == IPADDR_NONE || raw == 0) {
+            cliPrintf("ping: invalid IPv4 address\n");
+            return;
+        }
+        ip_addr_set_ip4_u32_val(target, raw);
+    }
+
+    const char* tstr = ipaddr_ntoa(&target);
+    cliPrintf("PING %s (%s): 56 data bytes\n", tstr ? tstr : "?", tstr ? tstr : "?");
+
+    constexpr uint32_t kDataSize = 56;
+    constexpr uint32_t kIntervalMs = 1000;
+    constexpr uint32_t kTimeoutMs = 2000;
+    const size_t icmpTotal = sizeof(struct icmp_echo_hdr) + kDataSize;
+    std::unique_ptr<uint8_t[]> pkt(new (std::nothrow) uint8_t[icmpTotal]);
+    if (!pkt) {
+        cliPrintf("ping: out of memory\n");
+        return;
+    }
+
+    int sock = socket(AF_INET, SOCK_RAW, IP_PROTO_ICMP);
+    if (sock < 0) {
+        cliPrintf("ping: socket(AF_INET, SOCK_RAW) failed errno=%d\n", errno);
+        return;
+    }
+    struct timeval tv;
+    tv.tv_sec = kTimeoutMs / 1000;
+    tv.tv_usec = (kTimeoutMs % 1000) * 1000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in to{};
+    to.sin_family = AF_INET;
+    inet_addr_from_ip4addr(&to.sin_addr, ip_2_ip4(&target));
+
+    auto* echo = reinterpret_cast<struct icmp_echo_hdr*>(pkt.get());
+    echo->type = ICMP_ECHO;
+    echo->code = 0;
+    echo->id = (uint16_t)(esp_random() & 0xFFFF);
+    echo->seqno = 0;
+    char* data = reinterpret_cast<char*>(pkt.get()) + sizeof(struct icmp_echo_hdr);
+    for (uint32_t i = 0; i < kDataSize; i++) data[i] = static_cast<char>('A' + (i % 26));
+
+    uint32_t tx = 0, rx = 0;
+    struct timeval t0{}, t1{};
+    gettimeofday(&t0, nullptr);
+
+    for (uint32_t n = 0; n < count; n++) {
+        echo->seqno = static_cast<uint16_t>(echo->seqno + 1);
+        echo->chksum = 0;
+        echo->chksum = inet_chksum(echo, icmpTotal);
+
+        struct timeval ts{};
+        gettimeofday(&ts, nullptr);
+        ssize_t sent = sendto(sock, pkt.get(), icmpTotal, 0, reinterpret_cast<struct sockaddr*>(&to), sizeof(to));
+        if (sent != (ssize_t)icmpTotal) {
+            cliPrintf("ping: sendto failed errno=%d\n", errno);
+            break;
+        }
+        tx++;
+
+        uint8_t ttl = 0;
+        uint32_t pay = 0;
+        int r = pingRecvEchoReply(sock, echo->id, echo->seqno, &ttl, &pay);
+        struct timeval te{};
+        gettimeofday(&te, nullptr);
+        uint32_t ms = (uint32_t)((te.tv_sec - ts.tv_sec) * 1000 + (te.tv_usec - ts.tv_usec) / 1000);
+
+        if (r > 0) {
+            rx++;
+            cliPrintf("%u bytes from %s: icmp_seq=%u ttl=%u time=%ums\n",
+                      (unsigned)(sizeof(struct icmp_echo_hdr) + pay), tstr ? tstr : "?",
+                      (unsigned)echo->seqno, (unsigned)ttl, (unsigned)ms);
+        } else {
+            cliPrintf("Request timeout for icmp_seq %u\n", (unsigned)echo->seqno);
+        }
+        if (n + 1 < count) delay(kIntervalMs);
+    }
+
+    gettimeofday(&t1, nullptr);
+    uint32_t dur = (uint32_t)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_usec - t0.tv_usec) / 1000);
+    unsigned lossPct = tx ? (unsigned)((100U * (tx - rx)) / tx) : 0;
+    cliPrintf("--- %u packets transmitted, %u received, %u%% packet loss, time %ums\n",
+              (unsigned)tx, (unsigned)rx, lossPct, (unsigned)dur);
+    close(sock);
+}
+
 /* ---- Public API ---- */
 
 static void netCliCmd(const char* args) {
@@ -756,6 +923,7 @@ static void netCliCmd(const char* args) {
 void netInit() {
   pmLockCreate(PM_NO_DEEP_SLEEP, "net", &netDeepLock);
   cliRegisterCmd("net", netCliCmd);
+  cliRegisterCmd("ping", pingCliCmd);
 
   for (int i = 0; i < NET_MAX_CLIENTS; i++) {
     netClients[i].fd = -1;
