@@ -581,6 +581,14 @@ static void netTaskFn(void* arg) {
     epOpenAll();
   });
 
+  /* Ephemeral keys that modules need delivered via NET_EV_CFG_CHANGED */
+  storageSubscribeChanges("wg.keygen", ON_CHANGE {
+    fireEvent(NET_EV_CFG_CHANGED, key);
+  });
+  storageSubscribeChanges("sys.time.set", ON_CHANGE {
+    fireEvent(NET_EV_CFG_CHANGED, key);
+  });
+
   wifiNetifInit();
 
   xSemaphoreGive(readySem);  /* unblock netInit — task is running */
