@@ -65,14 +65,6 @@ RTC_DATA_ATTR static bool rtcWantUp = false;
 
 static bool wantUp() { return rtcWantUp; }
 
-/* Known STA networks loaded from config (s.wifi.1..9) */
-static struct {
-  char ssid[33];
-  char pass[65];
-  char ip[16], gw[16], mask[16], dns[16];
-} staNet[MAX_STA_NETWORKS];
-static int staCount = 0;
-
 static pm_lock_handle_t netDeepLock = nullptr;
 
 /* ---- Event callback registry ---- */
@@ -382,27 +374,23 @@ static void wifiHwStart() {
   esp_sleep_enable_wifi_wakeup();
 }
 
-static void loadNetworks() {
-  staCount = 0;
-  for (int i = 1; i <= MAX_STA_NETWORKS; i++) {
-    char key[24];
-    snprintf(key, sizeof(key), "s.wifi.%d.ssid", i);
-    storageGetStr(key, staNet[staCount].ssid, sizeof(staNet[0].ssid));
-    if (!staNet[staCount].ssid[0]) break;
-    snprintf(key, sizeof(key), "s.wifi.%d.pass", i);
-    storageGetStr(key, staNet[staCount].pass, sizeof(staNet[0].pass));
-    snprintf(key, sizeof(key), "s.wifi.%d.ip", i);
-    storageGetStr(key, staNet[staCount].ip, sizeof(staNet[0].ip));
-    snprintf(key, sizeof(key), "s.wifi.%d.gw", i);
-    storageGetStr(key, staNet[staCount].gw, sizeof(staNet[0].gw));
-    snprintf(key, sizeof(key), "s.wifi.%d.mask", i);
-    storageGetStr(key, staNet[staCount].mask, sizeof(staNet[0].mask));
-    snprintf(key, sizeof(key), "s.wifi.%d.dns", i);
-    storageGetStr(key, staNet[staCount].dns, sizeof(staNet[0].dns));
-    info("loaded wifi%d ssid='%s'(%d) pass='%s'(%d)\n", i,
-         staNet[staCount].ssid, (int)strlen(staNet[staCount].ssid),
-         staNet[staCount].pass, (int)strlen(staNet[staCount].pass));
-    staCount++;
+/** Number of configured STA networks (from s.wifi.nets array). */
+static int staNetCount() { return storageArrayCount("s.wifi.nets"); }
+
+/** Read a field from s.wifi.nets[idx]. */
+static void staNetGet(int idx, const char* field, char* out, size_t len, const char* def = "") {
+  char key[48];
+  snprintf(key, sizeof(key), "s.wifi.nets.%d.%s", idx, field);
+  storageGetStr(key, out, len, def);
+}
+
+static void logNetworks() {
+  int n = staNetCount();
+  info("known networks: %d\n", n);
+  for (int i = 0; i < n; i++) {
+    char ssid[33];
+    staNetGet(i, "ssid", ssid, sizeof(ssid));
+    info("  [%d] '%s'\n", i, ssid);
   }
 }
 
@@ -421,33 +409,42 @@ static int scanForKnown() {
   for (int i = 0; i < ap_count; i++)
     dbg("  '%s' ch%d %ddBm\n", (const char*)ap_list[i].ssid, ap_list[i].primary, ap_list[i].rssi);
   int bestIdx = -1;
-  info("known networks: %d\n", staCount);
-  for (int s = 0; s < staCount; s++)
-    info("  [%d] '%s'\n", s, staNet[s].ssid);
-  for (int s = 0; s < staCount; s++)
+  int nNets = staNetCount();
+  logNetworks();
+  for (int s = 0; s < nNets; s++) {
+    char ssid[33];
+    staNetGet(s, "ssid", ssid, sizeof(ssid));
     for (int i = 0; i < ap_count; i++)
-      if (strcmp((const char*)ap_list[i].ssid, staNet[s].ssid) == 0) { bestIdx = s; goto found; }
+      if (strcmp((const char*)ap_list[i].ssid, ssid) == 0) { bestIdx = s; goto found; }
+  }
 found:
   free(ap_list);
   return bestIdx;
 }
 
 static bool connectSta(int idx) {
-  info("connecting to '%s' pass(%d chars)\n", staNet[idx].ssid, (int)strlen(staNet[idx].pass));
+  char ssid[33], pass[65], ip[16], gw[16], mask[16], dns[16];
+  staNetGet(idx, "ssid", ssid, sizeof(ssid));
+  staNetGet(idx, "pass", pass, sizeof(pass));
+  staNetGet(idx, "ip",   ip,   sizeof(ip));
+  staNetGet(idx, "gw",   gw,   sizeof(gw));
+  staNetGet(idx, "mask", mask, sizeof(mask));
+  staNetGet(idx, "dns",  dns,  sizeof(dns));
+  info("connecting to '%s' pass(%d chars)\n", ssid, (int)strlen(pass));
   esp_wifi_disconnect();
   delay(100);
   esp_wifi_set_mode(WIFI_MODE_STA);
   delay(100);
-  if (staNet[idx].ip[0]) {
+  if (ip[0]) {
     esp_netif_dhcpc_stop(sta_netif);
     esp_netif_ip_info_t ip_info = {};
-    ip_info.ip.addr      = ipaddr_addr(staNet[idx].ip);
-    ip_info.gw.addr      = ipaddr_addr(staNet[idx].gw);
-    ip_info.netmask.addr = ipaddr_addr(staNet[idx].mask);
+    ip_info.ip.addr      = ipaddr_addr(ip);
+    ip_info.gw.addr      = ipaddr_addr(gw);
+    ip_info.netmask.addr = ipaddr_addr(mask);
     esp_netif_set_ip_info(sta_netif, &ip_info);
     esp_netif_dns_info_t dns_info = {};
-    if (staNet[idx].dns[0])
-      dns_info.ip.u_addr.ip4.addr = ipaddr_addr(staNet[idx].dns);
+    if (dns[0])
+      dns_info.ip.u_addr.ip4.addr = ipaddr_addr(dns);
     else
       dns_info.ip.u_addr.ip4.addr = ip_info.gw.addr;
     dns_info.ip.type = ESP_IPADDR_TYPE_V4;
@@ -456,15 +453,15 @@ static bool connectSta(int idx) {
     esp_netif_dhcpc_start(sta_netif);
   }
   wifi_config_t wifi_config = {};
-  strncpy((char*)wifi_config.sta.ssid, staNet[idx].ssid, sizeof(wifi_config.sta.ssid));
-  if (staNet[idx].pass[0])
-    strncpy((char*)wifi_config.sta.password, staNet[idx].pass, sizeof(wifi_config.sta.password));
+  strncpy((char*)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
+  if (pass[0])
+    strncpy((char*)wifi_config.sta.password, pass, sizeof(wifi_config.sta.password));
   esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
   xSemaphoreTake(wifiConnectedSem, 0);
   staConnected = false;
   esp_wifi_connect();
   bool ok;
-  if (staNet[idx].ip[0]) {
+  if (ip[0]) {
     uint32_t t = millis();
     while (!staConnected && millis() - t < 15000) delay(200);
     wifi_ap_record_t ap_info;
@@ -481,21 +478,21 @@ static bool connectSta(int idx) {
     esp_netif_get_dns_info(sta_netif, ESP_NETIF_DNS_MAIN, &dns_info);
     char dns_str[16];
     esp_ip4addr_ntoa(&dns_info.ip.u_addr.ip4, dns_str, sizeof(dns_str));
-    info("%s ip %s dns %s\n", staNet[idx].ssid, ip_str, dns_str);
+    info("%s ip %s dns %s\n", ssid, ip_str, dns_str);
     return true;
   }
-  info("%s connect failed\n", staNet[idx].ssid);
+  info("%s connect failed\n", ssid);
   esp_wifi_disconnect();
   return false;
 }
 
 static bool startAP() {
-  if (storageGetInt("s.wifi.0.disable")) { info("AP disabled\n"); return false; }
+  if (storageGetInt("s.wifi.ap.disable")) { info("AP disabled\n"); return false; }
   char ssid[33], pass[65], ip[16], mask[16];
-  storageGetStr("s.wifi.0.ssid", ssid, sizeof(ssid), WIFI_AP_SSID);
-  storageGetStr("s.wifi.0.pass", pass, sizeof(pass), WIFI_AP_PASS);
-  storageGetStr("s.wifi.0.ip",   ip,   sizeof(ip),   WIFI_AP_IP);
-  storageGetStr("s.wifi.0.mask", mask, sizeof(mask),  WIFI_AP_MASK);
+  storageGetStr("s.wifi.ap.ssid", ssid, sizeof(ssid), WIFI_AP_SSID);
+  storageGetStr("s.wifi.ap.pass", pass, sizeof(pass), WIFI_AP_PASS);
+  storageGetStr("s.wifi.ap.ip",   ip,   sizeof(ip),   WIFI_AP_IP);
+  storageGetStr("s.wifi.ap.mask", mask, sizeof(mask),  WIFI_AP_MASK);
   esp_wifi_set_mode(WIFI_MODE_AP);
   esp_netif_dhcps_stop(ap_netif);
   esp_netif_ip_info_t ip_info = {};
@@ -605,7 +602,7 @@ static void netTaskFn(void* arg) {
     wifiHwStart();
     esp_wifi_set_mode(WIFI_MODE_STA);
     state = ST_SCANNING;
-    if (staCount == 0) {
+    if (staNetCount() == 0) {
       if (startAP()) { state = ST_AP; }
       else { state = ST_OFF; pmLockRelease(netDeepLock); }
     }
@@ -632,7 +629,6 @@ static void netTaskFn(void* arg) {
       if (state == ST_OFF) {
         info("coming up\n");
         pmLockAcquire(netDeepLock);
-        loadNetworks();
         setDhcpHostname();
         wifiHwStart();
         esp_wifi_set_mode(WIFI_MODE_STA);
@@ -689,7 +685,7 @@ static void netTaskFn(void* arg) {
         break;
       case ST_AP:
         netPollOnce();
-        if (staCount > 0 && wantUp() && millis() - lastApRetryMs >= AP_RETRY_MS) {
+        if (staNetCount() > 0 && wantUp() && millis() - lastApRetryMs >= AP_RETRY_MS) {
           lastApRetryMs = millis();
           fireEvent(NET_EV_DOWN);
           epCloseAll();
@@ -887,7 +883,7 @@ static void netCliCmd(const char* args) {
     if (wifiState == ST_AP) {
         cliPrintf("wifi: %s (AP) - %s\n\n", goingDown ? "going down" : "up", elapsed);
         char ssid[33];
-        storageGetStr("s.wifi.0.ssid", ssid, sizeof(ssid), WIFI_AP_SSID);
+        storageGetStr("s.wifi.ap.ssid", ssid, sizeof(ssid), WIFI_AP_SSID);
         esp_netif_ip_info_t ip_info;
         esp_netif_get_ip_info(ap_netif, &ip_info);
         char ip[16], mask[16];
@@ -943,7 +939,6 @@ void netInit() {
   /* Cold boot: default to up. Deep sleep wake: preserve previous state. */
   if (!rtcRamValid()) rtcWantUp = true;
 
-  loadNetworks();
   readySem = xSemaphoreCreateBinary();
   wifiConnectedSem = xSemaphoreCreateBinary();
   xTaskCreatePinnedToCoreWithCaps(netTaskFn, "net", 8192, nullptr, 2, &netHandle, 0, MALLOC_CAP_SPIRAM);
