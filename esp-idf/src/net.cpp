@@ -594,7 +594,7 @@ static void netTaskFn(void* arg) {
   wifi_state_t state = ST_OFF;
   uint32_t scanStartMs = millis();
   uint32_t lastApRetryMs = 0;
-  const uint32_t AP_RETRY_MS = 5 * 60 * 1000;
+  /* AP retry interval read from s.wifi.ap.retry (default 300s) */
 
   if (wantUp()) {
     pmLockAcquire(netDeepLock);
@@ -685,19 +685,28 @@ static void netTaskFn(void* arg) {
         break;
       case ST_AP:
         netPollOnce();
-        if (staNetCount() > 0 && wantUp() && millis() - lastApRetryMs >= AP_RETRY_MS) {
-          lastApRetryMs = millis();
-          fireEvent(NET_EV_DOWN);
-          epCloseAll();
-          esp_wifi_set_mode(WIFI_MODE_STA);
-          delay(100);
-          int idx = scanForKnown();
-          if (idx >= 0 && connectSta(idx)) {
-            state = ST_STA_CONNECTED;
-            doUp();
-          } else {
-            startAP();
-            doUp();
+        { uint32_t apRetryMs = (uint32_t)storageGetInt("s.wifi.ap.retry", 300) * 1000;
+          if (staNetCount() > 0 && wantUp() && millis() - lastApRetryMs >= apRetryMs) {
+            lastApRetryMs = millis();
+            /* Non-disruptive scan: APSTA keeps AP running for connected clients */
+            esp_wifi_set_mode(WIFI_MODE_APSTA);
+            delay(100);
+            int idx = scanForKnown();
+            if (idx >= 0) {
+              /* Found a known network — tear down AP and connect */
+              fireEvent(NET_EV_DOWN);
+              epCloseAll();
+              if (connectSta(idx)) {
+                state = ST_STA_CONNECTED;
+                doUp();
+              } else {
+                startAP();
+                doUp();
+              }
+            } else {
+              /* Nothing found — back to pure AP, no disruption */
+              esp_wifi_set_mode(WIFI_MODE_AP);
+            }
           }
         }
         break;
