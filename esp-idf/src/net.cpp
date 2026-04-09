@@ -58,7 +58,6 @@ static uint32_t trafficOut = 0;
 
 /* ITS aux command interface */
 enum { NET_CMD_UP = 1, NET_CMD_DOWN, NET_CMD_FORCE_DOWN };
-#define NET_CMD_PORT 1
 
 /* RTC state: survives deep sleep. On cold boot, boot file runs "net up". */
 RTC_DATA_ATTR static bool rtcWantUp = false;
@@ -126,7 +125,7 @@ static net_endpoint_t* epFindByKey(const char* nvsKey) {
 }
 
 /* ITS aux callback: tasks register TCP endpoints */
-static void netOnAux(TaskHandle_t sender, uint16_t port, const void* data, size_t len) {
+static void netOnAux(TaskHandle_t sender, const void* data, size_t len) {
     if (len < sizeof(net_port_msg_t)) return;
     auto* msg = (const net_port_msg_t*)data;
     net_endpoint_t* ep = epFindByKey(msg->nvsKey);
@@ -195,6 +194,8 @@ static void epCloseAll() {
     }
 }
 
+static void netItsDisconnect(int handle);
+
 static void netAcceptOne(int ei, int fd, tls_conn_t* conn, struct sockaddr_in* peer) {
     auto& ep = netEps[ei];
     int ci = -1;
@@ -203,7 +204,8 @@ static void netAcceptOne(int ei, int fd, tls_conn_t* conn, struct sockaddr_in* p
     if (ci < 0) { if (conn) tlsClose(conn); else close(fd); return; }
     net_connect_t cd = { 0, (uint8_t)(conn ? 1 : 0), {} };
     ip_addr_set_ip4_u32_val(cd.clientAddr, peer->sin_addr.s_addr);
-    int h = itsConnectByHandle(ep.task, ep.itsPort, &cd, sizeof(cd), pdMS_TO_TICKS(100));
+    int h = itsConnectByTaskHandle(ep.task, ep.itsPort, &cd, sizeof(cd),
+                                    pdMS_TO_TICKS(100), -1, nullptr, netItsDisconnect);
     if (h < 0) { if (conn) tlsClose(conn); else close(fd); return; }
     netClients[ci] = { fd, conn, h, ei, ep.task };
 }
@@ -556,7 +558,7 @@ static void doDown(wifi_state_t& state) {
   pmLockRelease(netDeepLock);
 }
 
-static void netCmdHandler(TaskHandle_t, uint16_t, const void* data, size_t len) {
+static void netCmdHandler(TaskHandle_t, const void* data, size_t len) {
   if (len < 1) return;
   uint8_t cmd = *(const uint8_t*)data;
   switch (cmd) {
@@ -568,9 +570,9 @@ static void netCmdHandler(TaskHandle_t, uint16_t, const void* data, size_t len) 
 
 
 static void netTaskFn(void* arg) {
-  itsClientInit(NET_MAX_CLIENTS, netItsDisconnect);
-  itsOnAux(netOnAux);
-  itsOnAux(netCmdHandler, NET_CMD_PORT);
+  itsClientInit(NET_MAX_CLIENTS);
+  itsOnAux(NET_PORT_REG_PORT, netOnAux);
+  itsOnAux(NET_CMD_PORT, netCmdHandler);
 
   storageSubscribeChanges("s.", ON_CHANGE {
     if (!netIsUp()) return;
@@ -958,14 +960,14 @@ void netUp() {
   rtcWantUp = true;
   if (!netHandle) return;  /* net task will pick up rtcWantUp on start */
   uint8_t cmd = NET_CMD_UP;
-  itsSendAuxByHandle(netHandle, &cmd, 1, pdMS_TO_TICKS(100), NET_CMD_PORT);
+  itsSendAuxByTaskHandle(netHandle, NET_CMD_PORT, &cmd, 1, pdMS_TO_TICKS(100));
 }
 
 void netDown(bool force) {
   rtcWantUp = false;
   if (!netHandle) return;
   uint8_t cmd = force ? NET_CMD_FORCE_DOWN : NET_CMD_DOWN;
-  itsSendAuxByHandle(netHandle, &cmd, 1, pdMS_TO_TICKS(100), NET_CMD_PORT);
+  itsSendAuxByTaskHandle(netHandle, NET_CMD_PORT, &cmd, 1, pdMS_TO_TICKS(100));
 }
 
 bool netIsUp() {

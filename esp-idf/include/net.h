@@ -68,9 +68,14 @@ void netGetLocalIp(char* out, size_t len);
 
 /* ---- ITS aux message: task → net TCP port registration ---- */
 
-/** Tasks send this to "net" via itsSendAux to register a TCP endpoint.
- *  Net opens a server socket, accepts connections, and connects to the
- *  registering task via ITS with the given itsPort on each client. */
+/** Net's aux ports. */
+static constexpr uint16_t NET_PORT_REG_PORT = 0;   /* tasks register TCP endpoints */
+static constexpr uint16_t NET_CMD_PORT      = 1;   /* CLI control: up/down */
+
+/** Tasks send this to "net" on NET_PORT_REG_PORT via itsSendAux to register
+ *  a TCP endpoint. Net opens a server socket, accepts connections, and
+ *  connects to the registering task via ITS with the given itsPort on
+ *  each client. */
 typedef struct {
     uint16_t itsPort;     /* ITS port number (passed to onConnect) */
     uint16_t tcpPort;     /* TCP listen port (0 = use nvsKey/defaultPort) */
