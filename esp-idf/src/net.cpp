@@ -24,11 +24,13 @@
 #include <cstdio>
 #include "esp_heap_caps.h"
 #include "esp_random.h"
+#include "esp_mac.h"
 #include <cerrno>
 #include <cctype>
 #include <cstdlib>
 #include <memory>
 #include <sys/time.h>
+#include <cJSON.h>
 #include "lwip/inet.h"
 #include "lwip/inet_chksum.h"
 #include "lwip/prot/icmp.h"
@@ -57,7 +59,8 @@ static uint32_t trafficOut = 0;
 #define WIFI_IDLE_TIMEOUT_MS 30000
 
 /* ITS aux command interface */
-enum { NET_CMD_UP = 1, NET_CMD_DOWN, NET_CMD_FORCE_DOWN };
+enum { NET_CMD_UP = 1, NET_CMD_DOWN, NET_CMD_FORCE_DOWN, NET_CMD_CONNECT, NET_CMD_DISCONNECT };
+static volatile int cmdConnectIdx = -1;  /* target network index for NET_CMD_CONNECT */
 
 /* RTC state: survives deep sleep. On cold boot, boot file runs "net up". */
 RTC_DATA_ATTR static bool rtcWantUp = false;
@@ -368,10 +371,11 @@ static void wifiNetifInit() {
   esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, nullptr);
 }
 
-static void wifiHwStart() {
+static void wifiHwStart(wifi_mode_t mode = WIFI_MODE_STA) {
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   esp_wifi_init(&cfg);
   esp_wifi_set_storage(WIFI_STORAGE_RAM);
+  esp_wifi_set_mode(mode);
   esp_wifi_start();
   esp_sleep_enable_wifi_wakeup();
 }
@@ -424,18 +428,171 @@ found:
   return bestIdx;
 }
 
+/* ---- WiFi state machine ---- */
+
+enum wifi_state_t { ST_OFF, ST_SCANNING, ST_STA_CONNECTED, ST_AP };
+static volatile wifi_state_t wifiState = ST_OFF;
+
+/** Perform a WiFi scan and publish results to wifi.scanned as a JSON array.
+ *  Each element: {ssid, bssid, rssi, locked}. Sorted by RSSI (strongest first). */
+static void publishScanResults() {
+  wifi_scan_config_t scan_config = {};
+  esp_err_t e = esp_wifi_scan_start(&scan_config, true);
+  if (e != ESP_OK) { info("scan failed: %s\n", esp_err_to_name(e)); return; }
+  uint16_t ap_count = 0;
+  esp_wifi_scan_get_ap_num(&ap_count);
+  if (ap_count == 0) {
+    storageSetTree("wifi.scanned", cJSON_CreateArray());
+    return;
+  }
+  wifi_ap_record_t* ap_list = (wifi_ap_record_t*)malloc(ap_count * sizeof(wifi_ap_record_t));
+  if (!ap_list) return;
+  esp_wifi_scan_get_ap_records(&ap_count, ap_list);
+
+  /* Sort by RSSI descending (strongest first) */
+  for (int i = 0; i < ap_count - 1; i++)
+    for (int j = i + 1; j < ap_count; j++)
+      if (ap_list[j].rssi > ap_list[i].rssi) {
+        wifi_ap_record_t tmp = ap_list[i];
+        ap_list[i] = ap_list[j];
+        ap_list[j] = tmp;
+      }
+
+  cJSON* arr = cJSON_CreateArray();
+  for (int i = 0; i < ap_count; i++) {
+    cJSON* obj = cJSON_CreateObject();
+    cJSON_AddStringToObject(obj, "ssid", (const char*)ap_list[i].ssid);
+    char bssid[18];
+    snprintf(bssid, sizeof(bssid), "%02x:%02x:%02x:%02x:%02x:%02x",
+             ap_list[i].bssid[0], ap_list[i].bssid[1], ap_list[i].bssid[2],
+             ap_list[i].bssid[3], ap_list[i].bssid[4], ap_list[i].bssid[5]);
+    cJSON_AddStringToObject(obj, "bssid", bssid);
+    cJSON_AddNumberToObject(obj, "rssi", ap_list[i].rssi);
+    cJSON_AddNumberToObject(obj, "locked", ap_list[i].authmode != WIFI_AUTH_OPEN ? 1 : 0);
+    cJSON_AddItemToArray(arr, obj);
+  }
+  free(ap_list);
+  storageSetTree("wifi.scanned", arr);
+}
+
+/** Publish current WiFi status as ephemeral keys.
+ *  wifi.sta.state — "off", "connecting", "connected"
+ *  wifi.sta.*     — station info (ssid, ip, router, etc.)
+ *  wifi.ap.state  — "off", "active"
+ *  wifi.ap.*      — access point info
+ *  wifi.mac       — STA MAC address */
+static void publishWifiStatus() {
+  storageBegin();
+
+  /* STA MAC address (always available — base MAC from efuse) */
+  uint8_t mac[6];
+  if (wifiState == ST_OFF || esp_wifi_get_mac(WIFI_IF_STA, mac) != ESP_OK)
+    esp_efuse_mac_get_default(mac);
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  storageSet("wifi.mac", macStr);
+
+  char inBuf[16], outBuf[16];
+  fmtSize(trafficIn, inBuf, sizeof(inBuf));
+  fmtSize(trafficOut, outBuf, sizeof(outBuf));
+  storageSet("wifi.traffic_in", inBuf);
+  storageSet("wifi.traffic_out", outBuf);
+
+  /* STA status */
+  bool connecting = (wifiState == ST_SCANNING);
+  storageSet("wifi.sta.state", wifiState == ST_STA_CONNECTED ? "connected"
+                               : connecting ? "connecting" : "off");
+  if (wifiState == ST_STA_CONNECTED) {
+    wifi_ap_record_t ap_info = {};
+    const char* ssid = "";
+    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) ssid = (const char*)ap_info.ssid;
+    storageSet("wifi.sta.ssid", ssid);
+    storageSet("wifi.sta.rssi", (int)ap_info.rssi);
+
+    esp_netif_ip_info_t ip_info;
+    esp_netif_get_ip_info(sta_netif, &ip_info);
+    char ip[16], gw[16], mask[16];
+    esp_ip4addr_ntoa(&ip_info.ip, ip, sizeof(ip));
+    esp_ip4addr_ntoa(&ip_info.gw, gw, sizeof(gw));
+    esp_ip4addr_ntoa(&ip_info.netmask, mask, sizeof(mask));
+    storageSet("wifi.sta.ip", ip);
+    storageSet("wifi.sta.router", gw);
+    storageSet("wifi.sta.netmask", mask);
+
+    esp_netif_dns_info_t dns1 = {};
+    char dns1s[16];
+    esp_netif_get_dns_info(sta_netif, ESP_NETIF_DNS_MAIN, &dns1);
+    esp_ip4addr_ntoa(&dns1.ip.u_addr.ip4, dns1s, sizeof(dns1s));
+    storageSet("wifi.sta.dns", dns1s);
+    storageSet("wifi.sta.up", 1);
+  } else {
+    storageSet("wifi.sta.ssid", "");
+    storageSet("wifi.sta.ip", "");
+    storageSet("wifi.sta.router", "");
+    storageSet("wifi.sta.netmask", "");
+    storageSet("wifi.sta.dns", "");
+    storageSet("wifi.sta.rssi", 0);
+    storageSet("wifi.sta.up", 0);
+  }
+
+  /* AP status — active in ST_AP or during APSTA transitions */
+  wifi_mode_t mode = WIFI_MODE_NULL;
+  if (wifiState != ST_OFF) esp_wifi_get_mode(&mode);
+  bool apActive = (wifiState == ST_AP) || (mode == WIFI_MODE_APSTA);
+  storageSet("wifi.ap.state", apActive ? "active" : "off");
+  if (apActive) {
+    char ssid[33];
+    storageGetStr("s.wifi.ap.ssid", ssid, sizeof(ssid), WIFI_AP_SSID);
+    storageSet("wifi.ap.ssid", ssid);
+
+    esp_netif_ip_info_t ip_info;
+    esp_netif_get_ip_info(ap_netif, &ip_info);
+    char ip[16], mask[16];
+    esp_ip4addr_ntoa(&ip_info.ip, ip, sizeof(ip));
+    esp_ip4addr_ntoa(&ip_info.netmask, mask, sizeof(mask));
+    storageSet("wifi.ap.ip", ip);
+    storageSet("wifi.ap.netmask", mask);
+    storageSet("wifi.ap.up", 1);
+  } else {
+    storageSet("wifi.ap.ssid", "");
+    storageSet("wifi.ap.ip", "");
+    storageSet("wifi.ap.netmask", "");
+    storageSet("wifi.ap.up", 0);
+  }
+  storageEnd();
+}
+
 static bool connectSta(int idx) {
-  char ssid[33], pass[65], ip[16], gw[16], mask[16], dns[16];
+  char ssid[33], pass[65], ip[16], gw[16], mask[16], dns[16], macStr[18];
   staNetGet(idx, "ssid", ssid, sizeof(ssid));
   staNetGet(idx, "pass", pass, sizeof(pass));
   staNetGet(idx, "ip",   ip,   sizeof(ip));
   staNetGet(idx, "gw",   gw,   sizeof(gw));
   staNetGet(idx, "mask", mask, sizeof(mask));
   staNetGet(idx, "dns",  dns,  sizeof(dns));
+  staNetGet(idx, "mac",  macStr, sizeof(macStr));
   info("connecting to '%s' pass(%d chars)\n", ssid, (int)strlen(pass));
   esp_wifi_disconnect();
   delay(100);
   esp_wifi_set_mode(WIFI_MODE_STA);
+
+  /* Custom MAC: set if configured, restore default if a custom one was active */
+  static bool customMacActive = false;
+  if (macStr[0]) {
+    uint8_t mac[6];
+    if (sscanf(macStr, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+               &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6) {
+      esp_wifi_set_mac(WIFI_IF_STA, mac);
+      customMacActive = true;
+      info("custom MAC %s\n", macStr);
+    }
+  } else if (customMacActive) {
+    uint8_t mac[6];
+    esp_efuse_mac_get_default(mac);
+    esp_wifi_set_mac(WIFI_IF_STA, mac);
+    customMacActive = false;
+  }
   delay(100);
   if (ip[0]) {
     esp_netif_dhcpc_stop(sta_netif);
@@ -465,11 +622,11 @@ static bool connectSta(int idx) {
   bool ok;
   if (ip[0]) {
     uint32_t t = millis();
-    while (!staConnected && millis() - t < 15000) delay(200);
+    while (!staConnected && millis() - t < 25000) delay(200);
     wifi_ap_record_t ap_info;
     ok = (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK);
   } else {
-    ok = (xSemaphoreTake(wifiConnectedSem, pdMS_TO_TICKS(15000)) == pdTRUE);
+    ok = (xSemaphoreTake(wifiConnectedSem, pdMS_TO_TICKS(25000)) == pdTRUE);
   }
   if (ok) {
     esp_netif_ip_info_t ip_info;
@@ -495,13 +652,14 @@ static bool startAP() {
   storageGetStr("s.wifi.ap.pass", pass, sizeof(pass), WIFI_AP_PASS);
   storageGetStr("s.wifi.ap.ip",   ip,   sizeof(ip),   WIFI_AP_IP);
   storageGetStr("s.wifi.ap.mask", mask, sizeof(mask),  WIFI_AP_MASK);
-  esp_wifi_set_mode(WIFI_MODE_AP);
+  /* Configure AP IP before setting mode — prevents DHCP auto-start on default 192.168.4.1 */
   esp_netif_dhcps_stop(ap_netif);
   esp_netif_ip_info_t ip_info = {};
   ip_info.ip.addr      = ipaddr_addr(ip);
   ip_info.gw.addr      = ipaddr_addr(ip);
   ip_info.netmask.addr = ipaddr_addr(mask);
   esp_netif_set_ip_info(ap_netif, &ip_info);
+  esp_wifi_set_mode(WIFI_MODE_AP);
   esp_netif_dhcps_start(ap_netif);
   wifi_config_t wifi_config = {};
   strncpy((char*)wifi_config.ap.ssid, ssid, sizeof(wifi_config.ap.ssid));
@@ -529,11 +687,6 @@ static void setDhcpHostname() {
   }
 }
 
-/* ---- WiFi state machine ---- */
-
-enum wifi_state_t { ST_OFF, ST_SCANNING, ST_STA_CONNECTED, ST_AP };
-static volatile wifi_state_t wifiState = ST_OFF;
-
 static void doUp() {
   esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
   connectTimeMs = millis();
@@ -543,6 +696,7 @@ static void doUp() {
   info("net up\n");
   storageSet("net.up", 1);
   fireEvent(NET_EV_UP);
+  publishWifiStatus();
 }
 
 static void doDown(wifi_state_t& state) {
@@ -556,7 +710,11 @@ static void doDown(wifi_state_t& state) {
   esp_wifi_deinit();
   state = ST_OFF;
   pmLockRelease(netDeepLock);
+  publishWifiStatus();
 }
+
+static volatile bool cmdDisconnect = false;
+static volatile uint32_t lastBrowserScanMs = 0;
 
 static void netCmdHandler(TaskHandle_t, const void* data, size_t len) {
   if (len < 1) return;
@@ -565,6 +723,10 @@ static void netCmdHandler(TaskHandle_t, const void* data, size_t len) {
     case NET_CMD_UP:         cmdUp = true; break;
     case NET_CMD_DOWN:       cmdDown = true; break;
     case NET_CMD_FORCE_DOWN: cmdForceDown = true; break;
+    case NET_CMD_DISCONNECT: cmdDisconnect = true; break;
+    case NET_CMD_CONNECT:
+      if (len >= 2) cmdConnectIdx = ((const uint8_t*)data)[1];
+      break;
   }
 }
 
@@ -588,6 +750,26 @@ static void netTaskFn(void* arg) {
     fireEvent(NET_EV_CFG_CHANGED, key);
   });
 
+  /* Browser WiFi panel triggers */
+  storageSubscribeChanges("wifi.scan", ON_CHANGE {
+    if (strcmp(key, "wifi.scan") != 0) return;  /* don't match wifi.scanned */
+    if (atoi(val) == 1) lastBrowserScanMs = 0;  /* trigger immediate scan */
+  });
+  storageSubscribeChanges("wifi.connect", ON_CHANGE {
+    if (strcmp(key, "wifi.connect") != 0) return;  /* prefix also matches wifi.connecting etc */
+    int idx = atoi(val);
+    if (idx >= 0 && idx < MAX_STA_NETWORKS) {
+      uint8_t buf[2] = { NET_CMD_CONNECT, (uint8_t)idx };
+      itsSendAuxByTaskHandle(netHandle, NET_CMD_PORT, buf, 2, pdMS_TO_TICKS(100));
+    }
+  });
+  storageSubscribeChanges("wifi.disconnect", ON_CHANGE {
+    if (atoi(val) == 1) {
+      uint8_t cmd = NET_CMD_DISCONNECT;
+      itsSendAuxByTaskHandle(netHandle, NET_CMD_PORT, &cmd, 1, pdMS_TO_TICKS(100));
+    }
+  });
+
   wifiNetifInit();
 
   xSemaphoreGive(readySem);  /* unblock netInit — task is running */
@@ -596,16 +778,16 @@ static void netTaskFn(void* arg) {
   wifi_state_t state = ST_OFF;
   uint32_t scanStartMs = millis();
   uint32_t lastApRetryMs = 0;
+  uint32_t lastStatusMs = 0;
   /* AP retry interval read from s.wifi.ap.retry (default 300s) */
 
   if (wantUp()) {
     pmLockAcquire(netDeepLock);
     setDhcpHostname();
-    wifiHwStart();
-    esp_wifi_set_mode(WIFI_MODE_STA);
+    wifiHwStart(WIFI_MODE_STA);
     state = ST_SCANNING;
     if (staNetCount() == 0) {
-      if (startAP()) { state = ST_AP; }
+      if (startAP()) { state = ST_AP; doUp(); }
       else { state = ST_OFF; pmLockRelease(netDeepLock); }
     }
   }
@@ -632,8 +814,7 @@ static void netTaskFn(void* arg) {
         info("coming up\n");
         pmLockAcquire(netDeepLock);
         setDhcpHostname();
-        wifiHwStart();
-        esp_wifi_set_mode(WIFI_MODE_STA);
+        wifiHwStart(WIFI_MODE_STA);
         state = ST_SCANNING;
         scanStartMs = millis();
         wifiState = state;
@@ -650,12 +831,79 @@ static void netTaskFn(void* arg) {
       }
     }
 
+    /* Browser-triggered disconnect */
+    if (cmdDisconnect) {
+      cmdDisconnect = false;
+      storageDeleteTree("wifi.disconnect");
+      if (state == ST_STA_CONNECTED) {
+        info("browser disconnect\n");
+        fireEvent(NET_EV_DOWN);
+        epCloseAll();
+        esp_wifi_disconnect();
+        if (startAP()) { state = ST_AP; doUp(); }
+        else { state = ST_SCANNING; scanStartMs = millis(); }
+        wifiState = state;
+        publishWifiStatus();
+        continue;
+      }
+    }
+
+    /* Browser-triggered connect to specific known network */
+    if (cmdConnectIdx >= 0) {
+      int idx = cmdConnectIdx;
+      cmdConnectIdx = -1;
+      storageDeleteTree("wifi.connect");
+      if (idx < staNetCount()) {
+        info("browser connect to net %d\n", idx);
+        if (state == ST_STA_CONNECTED || state == ST_AP) {
+          fireEvent(NET_EV_DOWN);
+          epCloseAll();
+        }
+        /* Use APSTA if we're in AP mode so browser stays connected */
+        if (state == ST_AP)
+          esp_wifi_set_mode(WIFI_MODE_APSTA);
+        if (connectSta(idx)) {
+          state = ST_STA_CONNECTED;
+          doUp();
+        } else {
+          /* Connect failed — stay in or start AP */
+          if (state != ST_AP) {
+            if (startAP()) { state = ST_AP; doUp(); }
+            else { state = ST_SCANNING; scanStartMs = millis(); }
+          } else {
+            esp_wifi_set_mode(WIFI_MODE_AP);
+            doUp();
+          }
+        }
+        wifiState = state;
+        publishWifiStatus();
+        continue;
+      }
+    }
+
     /* Graceful shutdown: want_up=0 + connected → wait for idle */
     if (!wantUp() && connected) {
       if (millis() - lastActivityMs >= WIFI_IDLE_TIMEOUT_MS) {
         info("idle, shutting down\n");
         doDown(state); wifiState = state; continue;
       }
+    }
+
+    /* Periodic status publishing (~30s) */
+    if (connected && millis() - lastStatusMs >= 30000) {
+      lastStatusMs = millis();
+      publishWifiStatus();
+    }
+
+    /* Browser-triggered WiFi scan (every 20s while wifi.scan=1) */
+    if (connected && storageGetInt("wifi.scan") == 1 &&
+        millis() - lastBrowserScanMs >= 20000) {
+      lastBrowserScanMs = millis();
+      if (state == ST_AP)
+        esp_wifi_set_mode(WIFI_MODE_APSTA);
+      publishScanResults();
+      if (state == ST_AP)
+        esp_wifi_set_mode(WIFI_MODE_AP);
     }
 
     switch (state) {
@@ -936,6 +1184,9 @@ static void netCliCmd(const char* args) {
 }
 
 void netInit() {
+  /* Suppress noisy WiFi driver block-ack renegotiation logs */
+  esp_log_level_set("wifi", ESP_LOG_WARN);
+
   pmLockCreate(PM_NO_DEEP_SLEEP, "net", &netDeepLock);
   cliRegisterCmd("net", netCliCmd);
   cliRegisterCmd("ping", pingCliCmd);
