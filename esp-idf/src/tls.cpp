@@ -2,6 +2,7 @@
  * tls — mbedTLS server: EC P-256 self-signed cert, /state/ storage, per-connection wrappers.
  */
 #include "tls.h"
+#include "fs.h"
 #include "storage.h"
 #include "log.h"
 #include "cli.h"
@@ -53,24 +54,22 @@ static std::string statePath(const char* key) {
 
 static bool stateWrite(const char* key, const uint8_t* data, size_t len) {
     auto path = statePath(key);
-    FILE* f = fopen(path.c_str(), "w");
-    if (!f) return false;
-    size_t written = fwrite(data, 1, len, f);
-    fclose(f);
+    int f = fs_open(path.c_str(), "w");
+    if (f < 0) return false;
+    size_t written = fs_write(data, 1, len, f);
+    fs_close(f);
     return written == len;
 }
 
 static bool stateRead(const char* key, std::string& out) {
     auto path = statePath(key);
-    FILE* f = fopen(path.c_str(), "r");
-    if (!f) return false;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (sz <= 0) { fclose(f); return false; }
-    out.resize((size_t)sz);
-    fread(out.data(), 1, (size_t)sz, f);
-    fclose(f);
+    struct stat st;
+    if (fs_stat(path.c_str(), &st) != 0 || st.st_size <= 0) return false;
+    int f = fs_open(path.c_str(), "r");
+    if (f < 0) return false;
+    out.resize((size_t)st.st_size);
+    fs_read(out.data(), 1, (size_t)st.st_size, f);
+    fs_close(f);
     return true;
 }
 
@@ -310,8 +309,8 @@ void tlsInit() {
     });
     cliRegisterCmd("cert delete", [](const char* a) {
         if (strcmp(a, "help") == 0) { cliPrintf("  %-*s delete TLS certificate\n", CLI_HELP_COL, "cert delete"); return; }
-        remove("/state/tls_cert.pem");
-        remove("/state/tls_key.pem");
+        fs_remove(FS_STATE "/tls_cert.pem");
+        fs_remove(FS_STATE "/tls_key.pem");
         if (ready) {
             mbedtls_x509_crt_free(&srvcert);
             mbedtls_pk_free(&pkey);
