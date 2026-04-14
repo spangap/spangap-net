@@ -260,6 +260,7 @@ static void netPollOnce() {
             tls_conn_t* conn = tlsAccept(ep.serverFd);
             if (!conn) continue;
             int fd = tlsFd(conn);
+            if (ep.tcpNoDelay) { int yes = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes)); }
             if (ep.keepAlive) {
                 int yes = 1; setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
                 int idle = 10; setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
