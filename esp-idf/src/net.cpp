@@ -893,7 +893,10 @@ static void netTaskFn(void* arg) {
     /* Periodic status publishing (~30s) */
     if (connected && millis() - lastStatusMs >= 30000) {
       lastStatusMs = millis();
+      uint32_t t0 = millis();
       publishWifiStatus();
+      uint32_t dt = millis() - t0;
+      if (dt > 200) verb("publishWifiStatus took %ums\n", (unsigned)dt);
     }
 
     /* Browser-triggered WiFi scan (every 20s while wifi.scan=1) */
