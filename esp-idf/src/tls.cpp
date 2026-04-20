@@ -538,7 +538,7 @@ static void tlsRegenTask(void* arg) {
 
     SemaphoreHandle_t sem = (SemaphoreHandle_t)arg;
     if (sem) xSemaphoreGive(sem);
-    vTaskDelete(nullptr);
+    killSelf();
 }
 
 void tlsReloadCert() {
@@ -562,7 +562,7 @@ void tlsReloadCert() {
 static void tlsRegenCert() {
     /* EC key gen needs ~10KB stack — run on a temporary task */
     SemaphoreHandle_t sem = xSemaphoreCreateBinary();
-    xTaskCreatePinnedToCoreWithCaps(tlsRegenTask, "tls_gen", 16384, sem, 1, nullptr, 0, MALLOC_CAP_DEFAULT);
+    spawnTask(tlsRegenTask, "tls_gen", 16384, sem, 1, 0);
     xSemaphoreTake(sem, portMAX_DELAY);
     vSemaphoreDelete(sem);
 }
