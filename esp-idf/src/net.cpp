@@ -1229,6 +1229,10 @@ bool netIsUp() {
   return wifiState == ST_STA_CONNECTED || wifiState == ST_AP;
 }
 
+bool netIsStaConnected() {
+  return wifiState == ST_STA_CONNECTED;
+}
+
 void netActivity() {
   lastActivityMs = millis();
 }

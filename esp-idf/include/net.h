@@ -55,6 +55,10 @@ void netDown(bool force = false);
 /** Returns true if WiFi is connected (STA or AP). */
 bool netIsUp();
 
+/** Returns true only when connected to an upstream network as STA.
+ *  AP-only mode returns false (no upstream). */
+bool netIsStaConnected();
+
 /** Signal network activity (resets idle timer for graceful shutdown). */
 void netActivity();
 
