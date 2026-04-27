@@ -381,13 +381,13 @@ static void wifiHwStart(wifi_mode_t mode = WIFI_MODE_STA) {
   esp_sleep_enable_wifi_wakeup();
 }
 
-/** Number of configured STA networks (from s.wifi.nets array). */
-static int staNetCount() { return storageArrayCount("s.wifi.nets"); }
+/** Number of configured STA networks (from s.net.wifi.nets array). */
+static int staNetCount() { return storageArrayCount("s.net.wifi.nets"); }
 
-/** Read a field from s.wifi.nets[idx]. */
+/** Read a field from s.net.wifi.nets[idx]. */
 static void staNetGet(int idx, const char* field, char* out, size_t len, const char* def = "") {
   char key[48];
-  snprintf(key, sizeof(key), "s.wifi.nets.%d.%s", idx, field);
+  snprintf(key, sizeof(key), "s.net.wifi.nets.%d.%s", idx, field);
   storageGetStr(key, out, len, def);
 }
 
@@ -433,6 +433,16 @@ found:
 
 enum wifi_state_t { ST_OFF, ST_SCANNING, ST_STA_CONNECTED, ST_AP };
 static volatile wifi_state_t wifiState = ST_OFF;
+static bool upstreamUp = false;  /* mirrors net.upstream — true iff in ST_STA_CONNECTED */
+
+/** Sync upstream state (net.upstream key + NET_EV_UPSTREAM_UP/DOWN events) to
+ *  whether we're STA-connected. Idempotent — only fires on real transitions. */
+static void setUpstream(bool up) {
+  if (upstreamUp == up) return;
+  upstreamUp = up;
+  storageSet("net.upstream", up ? 1 : 0);
+  fireEvent(up ? NET_EV_UPSTREAM_UP : NET_EV_UPSTREAM_DOWN);
+}
 
 /** Perform a WiFi scan and publish results to wifi.scanned as a JSON array.
  *  Each element: {ssid, bssid, rssi, locked}. Sorted by RSSI (strongest first). */
@@ -544,7 +554,7 @@ static void publishWifiStatus() {
   storageSet("wifi.ap.state", apActive ? "active" : "off");
   if (apActive) {
     char ssid[33];
-    storageGetStr("s.wifi.ap.ssid", ssid, sizeof(ssid), WIFI_AP_SSID);
+    storageGetStr("s.net.wifi.ap.ssid", ssid, sizeof(ssid), WIFI_AP_SSID);
     storageSet("wifi.ap.ssid", ssid);
 
     esp_netif_ip_info_t ip_info;
@@ -647,12 +657,12 @@ static bool connectSta(int idx) {
 }
 
 static bool startAP() {
-  if (storageGetInt("s.wifi.ap.disable")) { info("AP disabled\n"); return false; }
+  if (storageGetInt("s.net.wifi.ap.disable")) { info("AP disabled\n"); return false; }
   char ssid[33], pass[65], ip[16], mask[16];
-  storageGetStr("s.wifi.ap.ssid", ssid, sizeof(ssid), WIFI_AP_SSID);
-  storageGetStr("s.wifi.ap.pass", pass, sizeof(pass), WIFI_AP_PASS);
-  storageGetStr("s.wifi.ap.ip",   ip,   sizeof(ip),   WIFI_AP_IP);
-  storageGetStr("s.wifi.ap.mask", mask, sizeof(mask),  WIFI_AP_MASK);
+  storageGetStr("s.net.wifi.ap.ssid", ssid, sizeof(ssid), WIFI_AP_SSID);
+  storageGetStr("s.net.wifi.ap.pass", pass, sizeof(pass), WIFI_AP_PASS);
+  storageGetStr("s.net.wifi.ap.ip",   ip,   sizeof(ip),   WIFI_AP_IP);
+  storageGetStr("s.net.wifi.ap.mask", mask, sizeof(mask),  WIFI_AP_MASK);
   /* Configure AP IP before setting mode — prevents DHCP auto-start on default 192.168.4.1 */
   esp_netif_dhcps_stop(ap_netif);
   esp_netif_ip_info_t ip_info = {};
@@ -688,7 +698,7 @@ static void setDhcpHostname() {
   }
 }
 
-static void doUp() {
+static void doUp(wifi_state_t newState) {
   esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
   connectTimeMs = millis();
   trafficIn = trafficOut = 0;
@@ -697,11 +707,13 @@ static void doUp() {
   info("net up\n");
   storageSet("net.up", 1);
   fireEvent(NET_EV_UP);
+  setUpstream(newState == ST_STA_CONNECTED);
   publishWifiStatus();
 }
 
 static void doDown(wifi_state_t& state) {
   info("shutting down\n");
+  setUpstream(false);
   fireEvent(NET_EV_DOWN);
   epCloseAll();
   storageSet("net.up", 0);
@@ -737,19 +749,27 @@ static void netTaskFn(void* arg) {
   itsOnAux(NET_PORT_REG_PORT, netOnAux);
   itsOnAux(NET_CMD_PORT, netCmdHandler);
 
-  storageSubscribeChanges("s.", ON_CHANGE {
+  /* Net's own config: re-open endpoints when ports/host change. */
+  storageSubscribeChanges("s.net.", ON_CHANGE {
     if (!netIsUp()) return;
     fireEvent(NET_EV_CFG_CHANGED, key);
     epOpenAll();
   });
 
-  /* Ephemeral keys that modules need delivered via NET_EV_CFG_CHANGED */
-  storageSubscribeChanges("wg.keygen", ON_CHANGE {
+  /* Re-broadcast specific prefixes/keys via NET_EV_CFG_CHANGED for module
+   * helpers that don't have their own task (wg, ntp). Narrow on purpose —
+   * wildcarding "s." floods this task's inbox during burst writes (boot
+   * script, firmware default install, etc.) and the broad scope buys
+   * nothing: wgOnCfg/ntpOnCfg already filter by key prefix anyway. */
+  static auto rebroadcast = [](const char* key, const char*) {
+    if (!netIsUp()) return;
     fireEvent(NET_EV_CFG_CHANGED, key);
-  });
-  storageSubscribeChanges("sys.time.set", ON_CHANGE {
-    fireEvent(NET_EV_CFG_CHANGED, key);
-  });
+  };
+  storageSubscribeChanges("s.wg.",        rebroadcast);
+  storageSubscribeChanges("secrets.wg.",  rebroadcast);
+  storageSubscribeChanges("s.ntp.",       rebroadcast);
+  storageSubscribeChanges("wg.keygen",    rebroadcast);
+  storageSubscribeChanges("sys.time.set", rebroadcast);
 
   /* Browser WiFi panel triggers */
   storageSubscribeChanges("wifi.scan", ON_CHANGE {
@@ -775,12 +795,12 @@ static void netTaskFn(void* arg) {
 
   xSemaphoreGive(readySem);  /* unblock netInit — task is running */
 
-  int searchTimeout = storageGetInt("s.wifi.timeout");
+  int searchTimeout = storageGetInt("s.net.wifi.timeout");
   wifi_state_t state = ST_OFF;
   uint32_t scanStartMs = millis();
   uint32_t lastApRetryMs = 0;
   uint32_t lastStatusMs = 0;
-  /* AP retry interval read from s.wifi.ap.retry (default 300s) */
+  /* AP retry interval read from s.net.wifi.ap.retry (default 300s) */
 
   if (wantUp()) {
     pmLockAcquire(netDeepLock);
@@ -788,7 +808,7 @@ static void netTaskFn(void* arg) {
     wifiHwStart(WIFI_MODE_STA);
     state = ST_SCANNING;
     if (staNetCount() == 0) {
-      if (startAP()) { state = ST_AP; doUp(); }
+      if (startAP()) { state = ST_AP; doUp(state); }
       else { state = ST_OFF; pmLockRelease(netDeepLock); }
     }
   }
@@ -841,7 +861,7 @@ static void netTaskFn(void* arg) {
         fireEvent(NET_EV_DOWN);
         epCloseAll();
         esp_wifi_disconnect();
-        if (startAP()) { state = ST_AP; doUp(); }
+        if (startAP()) { state = ST_AP; doUp(state); }
         else { state = ST_SCANNING; scanStartMs = millis(); }
         wifiState = state;
         publishWifiStatus();
@@ -865,15 +885,15 @@ static void netTaskFn(void* arg) {
           esp_wifi_set_mode(WIFI_MODE_APSTA);
         if (connectSta(idx)) {
           state = ST_STA_CONNECTED;
-          doUp();
+          doUp(state);
         } else {
           /* Connect failed — stay in or start AP */
           if (state != ST_AP) {
-            if (startAP()) { state = ST_AP; doUp(); }
+            if (startAP()) { state = ST_AP; doUp(state); }
             else { state = ST_SCANNING; scanStartMs = millis(); }
           } else {
             esp_wifi_set_mode(WIFI_MODE_AP);
-            doUp();
+            doUp(state);
           }
         }
         wifiState = state;
@@ -916,9 +936,9 @@ static void netTaskFn(void* arg) {
         int idx = scanForKnown();
         if (idx >= 0 && connectSta(idx)) {
           state = ST_STA_CONNECTED;
-          doUp();
+          doUp(state);
         } else if (millis() - scanStartMs >= (uint32_t)(searchTimeout * 1000)) {
-          if (startAP()) { state = ST_AP; doUp(); }
+          if (startAP()) { state = ST_AP; doUp(state); }
           else { state = ST_OFF; pmLockRelease(netDeepLock); }
         } else {
           delay(2000);
@@ -939,7 +959,7 @@ static void netTaskFn(void* arg) {
         break;
       case ST_AP:
         netPollOnce();
-        { uint32_t apRetryMs = (uint32_t)storageGetInt("s.wifi.ap.retry", 300) * 1000;
+        { uint32_t apRetryMs = (uint32_t)storageGetInt("s.net.wifi.ap.retry", 300) * 1000;
           if (staNetCount() > 0 && wantUp() && millis() - lastApRetryMs >= apRetryMs) {
             lastApRetryMs = millis();
             /* Non-disruptive scan: APSTA keeps AP running for connected clients */
@@ -952,10 +972,10 @@ static void netTaskFn(void* arg) {
               epCloseAll();
               if (connectSta(idx)) {
                 state = ST_STA_CONNECTED;
-                doUp();
+                doUp(state);
               } else {
                 startAP();
-                doUp();
+                doUp(state);
               }
             } else {
               /* Nothing found — back to pure AP, no disruption */
@@ -966,6 +986,11 @@ static void netTaskFn(void* arg) {
         break;
     }
     wifiState = state;
+
+    /* Sync upstream marker against the loop's resolved state. setUpstream is
+     * idempotent, so this runs once per real transition and is a no-op
+     * otherwise — saves having to instrument every state-change site. */
+    setUpstream(state == ST_STA_CONNECTED);
   }
 }
 
@@ -1146,7 +1171,7 @@ static void netCliCmd(const char* args) {
     if (wifiState == ST_AP) {
         cliPrintf("wifi: %s (AP) - %s\n\n", goingDown ? "going down" : "up", elapsed);
         char ssid[33];
-        storageGetStr("s.wifi.ap.ssid", ssid, sizeof(ssid), WIFI_AP_SSID);
+        storageGetStr("s.net.wifi.ap.ssid", ssid, sizeof(ssid), WIFI_AP_SSID);
         esp_netif_ip_info_t ip_info;
         esp_netif_get_ip_info(ap_netif, &ip_info);
         char ip[16], mask[16];
@@ -1187,7 +1212,39 @@ static void netCliCmd(const char* args) {
     cliPrintf("  traffic: in %s, out %s\n", inBuf, outBuf);
 }
 
+/* Module config version. Bump when adding/changing defaults. See duckdns.cpp.
+ * net owns its sub-domains: s.net.{hostname,*_port,mdns,wifi.*,dns.*}. */
+#define NET_VERSION 1
+
 void netInit() {
+  int v = storageGetInt("s.net.version", 0);
+  if (v < NET_VERSION) {
+    storageDefaultTree("s.net", R"({
+      "hostname": "seccam",
+      "http_port":   80,
+      "https_port":  443,
+      "rtsp_port":   554,
+      "log_port":    0,
+      "cli_port":    0,
+      "webrtc_port": 4433,
+      "mdns": 1,
+      "dns":  { "fqdn": "" },
+      "wifi": {
+        "enable": 1,
+        "timeout": 20,
+        "ap": {
+          "ssid": "SECCAM",
+          "pass": "",
+          "ip":   "192.168.1.1",
+          "mask": "255.255.255.0",
+          "retry": 300
+        },
+        "nets": []
+      }
+    })");
+    storageSet("s.net.version", NET_VERSION);
+  }
+
   /* Suppress noisy WiFi driver block-ack renegotiation logs */
   esp_log_level_set("wifi", ESP_LOG_WARN);
 

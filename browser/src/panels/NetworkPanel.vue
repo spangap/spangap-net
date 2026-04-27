@@ -2,7 +2,7 @@
   <div class="q-gutter-y-md">
     <PanelHeading>WiFi</PanelHeading>
     <div class="q-gutter-y-sm">
-      <SettingToggle label="Enable" k="s.wifi.enable" />
+      <SettingToggle label="Enable" k="s.net.wifi.enable" />
 
       <!-- STA status -->
       <div v-if="staUp" class="status-block q-mt-sm">
@@ -106,10 +106,10 @@
       </div>
 
       <template v-if="apEnabled">
-        <SettingText label="SSID" k="s.wifi.ap.ssid" />
-        <SettingText label="Password" k="s.wifi.ap.pass" />
-        <SettingText label="IP" k="s.wifi.ap.ip" />
-        <SettingText label="Netmask" k="s.wifi.ap.mask" />
+        <SettingText label="SSID" k="s.net.wifi.ap.ssid" />
+        <SettingText label="Password" k="s.net.wifi.ap.pass" />
+        <SettingText label="IP" k="s.net.wifi.ap.ip" />
+        <SettingText label="Netmask" k="s.net.wifi.ap.mask" />
       </template>
     </div>
 
@@ -190,7 +190,7 @@ const rssiLabel = computed(() => {
 interface KnownNet { ssid: string; pass: string; ip: string; gw: string; mask: string; dns: string; mac: string }
 
 const nets = computed<KnownNet[]>(() => {
-  const arr = device.get('s.wifi.nets')
+  const arr = device.get('s.net.wifi.nets')
   if (!Array.isArray(arr)) return []
   return arr.map((n: any) => ({
     ssid: String(n?.ssid ?? ''),
@@ -324,17 +324,17 @@ function doDisconnect() { device.set('wifi.disconnect', 1) }
 
 // ---- AP ----
 
-const apEnabled = computed(() => !device.get('s.wifi.ap.disable'))
+const apEnabled = computed(() => !device.get('s.net.wifi.ap.disable'))
 const showApWarning = ref(false)
 
 function onApToggle(val: boolean) {
   if (!val) showApWarning.value = true
-  else device.set('s.wifi.ap.disable', 0)
+  else device.set('s.net.wifi.ap.disable', 0)
 }
 
 function confirmApDisable() {
   showApWarning.value = false
-  device.set('s.wifi.ap.disable', 1)
+  device.set('s.net.wifi.ap.disable', 1)
 }
 
 // ---- Scanning lifecycle: only while scan dialog is open ----

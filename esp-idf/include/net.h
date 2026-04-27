@@ -28,10 +28,18 @@
 /* ---- Event system ---- */
 
 enum {
-    NET_EV_UP,           /* WiFi connected (STA got IP or AP started). arg = NULL */
-    NET_EV_DOWN,         /* WiFi going down. arg = NULL */
-    NET_EV_CFG_CHANGED,  /* config key changed. arg = key name */
-    NET_EV_POLL,         /* periodic (~10ms when connected). arg = NULL */
+    NET_EV_UP,            /* WiFi connected (STA got IP or AP started). arg = NULL.
+                             Mirrored to ephemeral storage key "net.up" (1/0). */
+    NET_EV_DOWN,          /* WiFi going down. arg = NULL */
+    NET_EV_UPSTREAM_UP,   /* STA connected to a real upstream network — internet
+                             reachable. AP-only does NOT fire this event. arg = NULL.
+                             Mirrored to ephemeral storage key "net.upstream" (1/0).
+                             Modules that need internet (duckdns, ntp, wg, upnp,
+                             cloud HTTP clients) should use this instead of UP. */
+    NET_EV_UPSTREAM_DOWN, /* STA leaving connected state. arg = NULL. Fires on
+                             disconnect, reconnect-loop, or transition to AP-only. */
+    NET_EV_CFG_CHANGED,   /* config key changed. arg = key name */
+    NET_EV_POLL,          /* periodic (~10ms when connected). arg = NULL */
     NET_EV_COUNT
 };
 
