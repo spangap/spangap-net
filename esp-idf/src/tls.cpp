@@ -77,7 +77,7 @@ static bool stateRead(const char* key, std::string& out) {
 
 static std::string nvsHostnameLocal() {
     char hostname[32];
-    storageGetStr("s.net.hostname", hostname, sizeof(hostname), "seccam");
+    storageGetStr("s.net.hostname", hostname, sizeof(hostname), "");
     return std::string(hostname) + ".local";
 }
 
@@ -259,8 +259,12 @@ void tlsInit() {
     mbedtls_pk_init(&pkey);
     mbedtls_ssl_config_init(&conf);
 
+    /* CTR_DRBG personalization string — domain-separates RNG output across
+     * uses. Pull from the device hostname so it's per-device-distinct. */
+    char pers[32];
+    storageGetStr("s.net.hostname", pers, sizeof(pers), "tls-server");
     int ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy,
-                                     (const uint8_t*)"seccam", 6);
+                                     (const uint8_t*)pers, strlen(pers));
     if (ret != 0) {
         err("ctr_drbg_seed: -0x%04x\n", -ret);
         return;

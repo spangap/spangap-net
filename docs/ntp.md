@@ -28,6 +28,14 @@ Timezone uses POSIX TZ format, e.g.:
 
 DNS must be reachable for NTP to work.
 
+## Timezone after factory reset
+
+`ntpApplyTimezone()` ([main/ntp.cpp:38](../main/ntp.cpp#L38)) reads `s.ntp.tz` (IANA name) and sets the POSIX `TZ` env var via `setenv` + `tzset()`. After a factory reset both `s.ntp.tz` and the cached `s.ntp.posix` are unset, so `ntpApplyTimezone()` early-exits and `TZ` stays unset — `localtime_r()` then returns UTC. The browser pushes the user's IANA timezone via `s.ntp.tz` (and POSIX string via `s.ntp.posix`) on first connect, after which `tzset` runs and timestamps shift to local time.
+
+So on a fresh device, all log lines printed before the first browser connection have **UTC** wall-clock timestamps. The boot order matters: `ntpApplyTimezone()` is called once early in `main.cpp` (line 162, before `logInit`) and again from `ntpStart` when STA upstream comes up. Neither call changes `TZ` if `s.ntp.tz` is unset — the browser connection is the trigger.
+
+This is intentional (no "default timezone" guess), but worth knowing when reading early-boot logs after a factory reset.
+
 ## WiFi lifecycle
 
 `net.cpp` calls `ntpBegin()` on network up and `ntpStop()` on network down. On network down→up cycle, `ntpBegin()` is called again (re-inits SNTP with fresh config from storage).

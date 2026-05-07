@@ -689,13 +689,9 @@ static bool startAP() {
 }
 
 static void setDhcpHostname() {
-  if (storageGetInt("s.net.mdns", 1)) {
-    char hostname[32];
-    storageGetStr("s.net.hostname", hostname, sizeof(hostname), "seccam");
-    esp_netif_set_hostname(sta_netif, hostname);
-  } else {
-    esp_netif_set_hostname(sta_netif, "");
-  }
+  char hostname[32];
+  storageGetStr("s.net.hostname", hostname, sizeof(hostname), "");
+  esp_netif_set_hostname(sta_netif, hostname);
 }
 
 static void doUp(wifi_state_t newState) {
@@ -1227,7 +1223,7 @@ void netInit() {
       "log_port":    0,
       "cli_port":    0,
       "webrtc_port": 4433,
-      "mdns": 1,
+      "mdns": { "http": 80, "https": 443 },
       "dns":  { "fqdn": "" },
       "wifi": {
         "enable": 1,
