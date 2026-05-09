@@ -1,0 +1,30 @@
+{
+  "name": "diptych-browser",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Browser-side runtime + UI for diptych device apps: WebRTC session, settings UI, FloatingWindow, log/CLI windows, default panels and pages, auth flow.",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts",
+    "./lib/*": "./src/lib/*.ts",
+    "./stores/*": "./src/stores/*.ts",
+    "./modules/*": "./src/modules/*.ts",
+    "./components/*.vue": "./src/components/*.vue",
+    "./panels/*.vue": "./src/panels/*.vue",
+    "./pages/*.vue": "./src/pages/*.vue"
+  },
+  "peerDependencies": {
+    "vue": "^3.5.0",
+    "quasar": "^2.17.0",
+    "pinia": "^3.0.4",
+    "vue-router": "^4.4.0"
+  },
+  "dependencies": {
+    "@xterm/xterm": "^6.0.0",
+    "@xterm/addon-fit": "^0.11.0",
+    "register-service-worker": "^1.7.2",
+    "workbox-precaching": "^7.4.0",
+    "workbox-routing": "^7.4.0",
+    "workbox-strategies": "^7.4.0"
+  }
+}
