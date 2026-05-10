@@ -11,9 +11,12 @@
 #include <lwip/ip_addr.h>
 #include <lwip/sockets.h>
 
-/* Compiler-define fallbacks for AP mode (survive factory reset) */
+/* Compiler-define fallbacks for AP mode (survive factory reset).
+ * AP SSID defaults to the project name (CONFIG_DIPTYCH_PROJECT_NAME) so a
+ * fresh device on a new project doesn't broadcast a stale SSID from the
+ * previously-flashed project. */
 #ifndef WIFI_AP_SSID
-#define WIFI_AP_SSID "SECCAM"
+#define WIFI_AP_SSID CONFIG_DIPTYCH_PROJECT_NAME
 #endif
 #ifndef WIFI_AP_PASS
 #define WIFI_AP_PASS ""
@@ -82,6 +85,17 @@ void netGetLocalIp(char* out, size_t len);
 /** Net's aux ports. */
 static constexpr uint16_t NET_PORT_REG_PORT = 0;   /* tasks register TCP endpoints */
 static constexpr uint16_t NET_CMD_PORT      = 1;   /* CLI control: up/down */
+
+/** Outbound TCP dial. Connect to net at this port with a "host:port" ASCII
+ *  payload (NUL-terminated, ≤95 bytes). Net does DNS + connect on its own
+ *  task and accepts the ITS connection on success. The accepted ITS handle
+ *  IS the TCP byte stream from byte zero; net proxies bytes both ways
+ *  using its existing select loop, same as inbound TCP. Closing the ITS
+ *  handle closes the socket.
+ *
+ *  Stream-mode (NOT packet-mode): TCP is a byte stream. Callers needing
+ *  framing (HDLC, length-prefix, line-delimited) layer it on top. */
+static constexpr uint16_t NET_PORT_TCP_DIAL = 2;
 
 /** Tasks send this to "net" on NET_PORT_REG_PORT via itsSendAux to register
  *  a TCP endpoint. Net opens a server socket, accepts connections, and

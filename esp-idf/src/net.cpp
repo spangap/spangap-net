@@ -14,6 +14,7 @@
 #include "its.h"
 #include "tls.h"
 #include <lwip/sockets.h>
+#include <lwip/netdb.h>
 #include <fcntl.h>
 #include "esp_wifi.h"
 #include "esp_sleep.h"
@@ -347,6 +348,100 @@ static void netItsDisconnect(int handle) {
             break;
         }
     }
+}
+
+/* ---- NET_PORT_TCP_DIAL: outbound dial-on-behalf-of ---- */
+
+/* Synchronous DNS + non-blocking connect with bounded wait. Returns
+ * connected fd >= 0 on success, -1 on failure. Runs on the net task —
+ * a slow DNS lookup briefly stalls net's select loop, acceptable for
+ * the dial cadence (RNS peer reconnects, not high-rate). */
+static int netDialSync(const char* host, uint16_t port, uint32_t timeoutMs) {
+    if (!netIsStaConnected()) return -1;
+
+    char portStr[8];
+    snprintf(portStr, sizeof(portStr), "%u", (unsigned)port);
+    struct addrinfo hints = {};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo* res = nullptr;
+    if (getaddrinfo(host, portStr, &hints, &res) != 0 || !res) {
+        warn("dial: DNS failed for %s\n", host);
+        return -1;
+    }
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) { freeaddrinfo(res); return -1; }
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+    int yes = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+
+    int rc = connect(fd, res->ai_addr, res->ai_addrlen);
+    freeaddrinfo(res);
+    if (rc != 0 && errno != EINPROGRESS) {
+        warn("dial: connect %s:%u immediate fail (errno %d)\n", host, port, errno);
+        close(fd);
+        return -1;
+    }
+
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(fd, &wfds);
+    struct timeval tv = { (long)(timeoutMs / 1000), (long)((timeoutMs % 1000) * 1000) };
+    int sel = select(fd + 1, nullptr, &wfds, nullptr, &tv);
+    if (sel <= 0) {
+        warn("dial: connect %s:%u timeout\n", host, port);
+        close(fd);
+        return -1;
+    }
+    int soerr = 0;
+    socklen_t soerrLen = sizeof(soerr);
+    getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &soerrLen);
+    if (soerr != 0) {
+        warn("dial: connect %s:%u failed (errno %d)\n", host, port, soerr);
+        close(fd);
+        return -1;
+    }
+    info("dial: connected %s:%u (fd=%d)\n", host, port, fd);
+    return fd;
+}
+
+static int netOnDialConnect(int handle, const void* data, size_t len) {
+    if (!data || len == 0) return -1;
+    char buf[96];
+    size_t n = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
+    memcpy(buf, data, n);
+    buf[n] = '\0';
+    char* colon = strrchr(buf, ':');
+    if (!colon) return -1;
+    *colon = '\0';
+    int port = atoi(colon + 1);
+    if (port <= 0 || port > 65535) return -1;
+
+    int fd = netDialSync(buf, (uint16_t)port, 8000);
+    if (fd < 0) return -1;
+
+    int ci = -1;
+    for (int i = 0; i < NET_MAX_CLIENTS; i++)
+        if (netClients[i].fd < 0) { ci = i; break; }
+    if (ci < 0) { close(fd); return -1; }
+
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+    int idle = 30; setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    int intvl = 10; setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    int cnt = 3;   setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+
+    netClients[ci] = { fd, nullptr, handle, -1, nullptr };
+    return ci;
+}
+
+static void netOnDialDisconnect(int ref) {
+    if (ref < 0 || ref >= NET_MAX_CLIENTS) return;
+    auto& c = netClients[ref];
+    if (c.fd >= 0) close(c.fd);
+    c.fd = -1;
+    c.tlsConn = nullptr;
+    c.itsHandle = -1;
 }
 
 /* ---- WiFi event handler ---- */
@@ -744,6 +839,12 @@ static void netCmdHandler(TaskHandle_t, const void* data, size_t len) {
 
 static void netTaskFn(void* arg) {
   itsClientInit(NET_MAX_CLIENTS);
+  itsServerInit();
+  itsServerPortOpen(NET_PORT_TCP_DIAL, /*packetBased=*/false,
+                    /*maxHandles=*/NET_MAX_CLIENTS,
+                    /*toSize=*/4096, /*fromSize=*/4096);
+  itsServerOnConnect(NET_PORT_TCP_DIAL, netOnDialConnect);
+  itsServerOnDisconnect(NET_PORT_TCP_DIAL, netOnDialDisconnect);
   itsOnAux(NET_PORT_REG_PORT, netOnAux);
   itsOnAux(NET_CMD_PORT, netCmdHandler);
 
@@ -1217,8 +1318,10 @@ static void netCliCmd(const char* args) {
 void netInit() {
   int v = storageGetInt("s.net.version", 0);
   if (v < NET_VERSION) {
+    /* hostname and AP SSID interpolate CONFIG_DIPTYCH_PROJECT_NAME so a fresh
+     * device tracks the project name instead of hardcoded legacy strings. */
     storageDefaultTree("s.net", R"({
-      "hostname": "seccam",
+      "hostname": ")" CONFIG_DIPTYCH_PROJECT_NAME R"(",
       "http_port":   80,
       "https_port":  443,
       "rtsp_port":   554,
@@ -1231,7 +1334,7 @@ void netInit() {
         "enable": 1,
         "timeout": 20,
         "ap": {
-          "ssid": "SECCAM",
+          "ssid": ")" CONFIG_DIPTYCH_PROJECT_NAME R"(",
           "pass": "",
           "ip":   "192.168.1.1",
           "mask": "255.255.255.0",
