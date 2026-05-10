@@ -234,7 +234,7 @@ function writeNets(arr: any[]) {
       if (typeof v === 'string' && v !== '') out[k] = v
     return out
   })
-  device.sendJson({ s: { wifi: { nets: clean } } })
+  device.sendJson({ s: { net: { wifi: { nets: clean } } } })
   device.save()
 }
 
