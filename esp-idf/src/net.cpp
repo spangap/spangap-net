@@ -151,7 +151,9 @@ static void netOnAux(TaskHandle_t sender, const void* data, size_t len) {
 }
 
 static void epOpenPort(net_endpoint_t& ep) {
-    int newPort = storageGetInt(ep.nvsKey, ep.defaultPort);
+    char fullKey[32];
+    snprintf(fullKey, sizeof(fullKey), "s.net.%s", ep.nvsKey);
+    int newPort = storageGetInt(fullKey, ep.defaultPort);
     if (newPort == ep.port && (newPort <= 0 || ep.serverFd >= 0)) return;
     if (ep.serverFd >= 0) {
         info("closing port %d (%s)\n", ep.port, ep.nvsKey);
