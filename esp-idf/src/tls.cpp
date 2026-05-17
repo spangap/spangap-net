@@ -49,7 +49,7 @@ static bool ready = false;
 /* ---- State file helpers (certs stored on /state/ LittleFS partition) ---- */
 
 static std::string statePath(const char* key) {
-    return std::string("/state/") + key + ".pem";
+    return std::string(fsStateDir()) + "/" + key + ".pem";
 }
 
 static bool stateWrite(const char* key, const uint8_t* data, size_t len) {
@@ -313,8 +313,8 @@ void tlsInit() {
     });
     cliRegisterCmd("cert delete", [](const char* a) {
         if (strcmp(a, "help") == 0) { cliPrintf("  %-*s delete TLS certificate\n", CLI_HELP_COL, "cert delete"); return; }
-        fs_remove(FS_STATE "/tls_cert.pem");
-        fs_remove(FS_STATE "/tls_key.pem");
+        fs_remove(fsStatePath("/tls_cert.pem").c_str());
+        fs_remove(fsStatePath("/tls_key.pem").c_str());
         if (ready) {
             mbedtls_x509_crt_free(&srvcert);
             mbedtls_pk_free(&pkey);
