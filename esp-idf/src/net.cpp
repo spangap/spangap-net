@@ -79,10 +79,23 @@ static struct {
     int count;
 } evRegistry[NET_EV_COUNT] = {};
 
+/* Current link state, so a handler that registers AFTER the net task has
+ * already brought the link up still gets the UP edge — registration order
+ * vs. bring-up must not matter (this is what made mDNS flaky on fresh
+ * AP-only boots: net task fired NET_EV_UP before mdnsInit registered). */
+static bool s_linkUp   = false;  /* true between doUp() and doDown()  */
+static bool upstreamUp = false;  /* true iff in ST_STA_CONNECTED      */
+
 void netRegister(int event, net_event_cb_t cb) {
     if (event < 0 || event >= NET_EV_COUNT) return;
     auto& r = evRegistry[event];
     if (r.count < NET_MAX_CBS) r.cbs[r.count++] = cb;
+    /* Level-replay the UP edges to a late subscriber. DOWN/CFG/POLL stay
+     * edge-only (replaying a teardown to a handler that never set up would
+     * be wrong). Note: cb may run synchronously here, on the caller's task
+     * rather than the net task — UP handlers must be idempotent. */
+    if      (event == NET_EV_UP          && s_linkUp)   cb(nullptr);
+    else if (event == NET_EV_UPSTREAM_UP && upstreamUp) cb(nullptr);
 }
 
 static void fireEvent(int event, const char* arg = nullptr) {
@@ -530,7 +543,8 @@ found:
 
 enum wifi_state_t { ST_OFF, ST_SCANNING, ST_STA_CONNECTED, ST_AP };
 static volatile wifi_state_t wifiState = ST_OFF;
-static bool upstreamUp = false;  /* true iff in ST_STA_CONNECTED */
+/* s_linkUp / upstreamUp are declared up by netRegister() so it can replay
+ * current state to late subscribers. */
 
 /** Sync upstream state (NET_EV_UPSTREAM_UP/DOWN events) to whether we're
  *  STA-connected. Idempotent — only fires on real transitions. */
@@ -795,6 +809,7 @@ static void doUp(wifi_state_t newState) {
    * also assigns `wifiState = state` after we return, but subscribers to
    * wifi.{sta,ap}.up read the value published here. */
   wifiState = newState;
+  s_linkUp = true;         /* set before fireEvent so late-replay is consistent */
   esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
   connectTimeMs = millis();
   trafficIn = trafficOut = 0;
@@ -808,6 +823,7 @@ static void doUp(wifi_state_t newState) {
 
 static void doDown(wifi_state_t& state) {
   info("shutting down\n");
+  s_linkUp = false;        /* clear before fireEvent so late-replay is consistent */
   setUpstream(false);
   fireEvent(NET_EV_DOWN);
   epCloseAll();
