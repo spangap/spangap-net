@@ -1352,7 +1352,6 @@ void netInit() {
         "enable": 1,
         "timeout": 20,
         "ap": {
-          "ssid": ")" CONFIG_DIPTYCH_PROJECT_NAME R"(",
           "pass": "",
           "ip":   "192.168.1.1",
           "mask": "255.255.255.0",
@@ -1361,6 +1360,20 @@ void netInit() {
         "nets": []
       }
     })");
+    /* Per-device AP SSID: "<hostname>_<last 2 MAC bytes hex>" so a fleet of
+     * units doesn't all present an identical AP. Computed from code here
+     * (storageDefaultTree just defaulted hostname) and stored once;
+     * user-editable afterwards and persisted. */
+    {
+      char host[32];
+      storageGetStr("s.net.hostname", host, sizeof(host),
+                    CONFIG_DIPTYCH_PROJECT_NAME);
+      uint8_t mac[6] = {};
+      esp_efuse_mac_get_default(mac);
+      char apssid[40];
+      snprintf(apssid, sizeof(apssid), "%s_%02x%02x", host, mac[4], mac[5]);
+      storageDefault("s.net.wifi.ap.ssid", apssid);
+    }
     storageSet("s.net.version", NET_VERSION);
   }
 
