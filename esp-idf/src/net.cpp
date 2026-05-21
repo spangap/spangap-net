@@ -630,6 +630,7 @@ static void publishWifiStatus() {
     if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) ssid = (const char*)ap_info.ssid;
     storageSet("wifi.sta.ssid", ssid);
     storageSet("wifi.sta.rssi", (int)ap_info.rssi);
+    storageSet("wifi.sta.channel", (int)ap_info.primary);
 
     esp_netif_ip_info_t ip_info;
     esp_netif_get_ip_info(sta_netif, &ip_info);
@@ -654,6 +655,7 @@ static void publishWifiStatus() {
     storageSet("wifi.sta.netmask", "");
     storageSet("wifi.sta.dns", "");
     storageSet("wifi.sta.rssi", 0);
+    storageSet("wifi.sta.channel", 0);
     storageSet("wifi.sta.up", 0);
   }
 
