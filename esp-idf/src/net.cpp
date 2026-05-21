@@ -858,6 +858,9 @@ static void netCmdHandler(TaskHandle_t, const void* data, size_t len) {
 
 
 static void netTaskFn(void* arg) {
+  /* Allocate the proxy buffer in task context so heap tracking attributes it
+     to net, not the main task that spawned us. */
+  netProxyBuf = (uint8_t*)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
   itsClientInit(NET_MAX_CLIENTS);
   itsServerInit();
   itsServerPortOpen(NET_PORT_TCP_DIAL, /*packetBased=*/false,
@@ -1391,8 +1394,6 @@ void netInit() {
     netClients[i].tlsConn = nullptr;
     netClients[i].itsHandle = -1;
   }
-  netProxyBuf = (uint8_t*)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
-
   /* Cold boot: default to up. Deep sleep wake: preserve previous state. */
   if (!rtcRamValid()) rtcWantUp = true;
 
