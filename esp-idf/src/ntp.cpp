@@ -29,6 +29,13 @@ static void updateTimeValid() {
   storageSet("sys.time.valid", timeValid() ? 1 : 0);
 }
 
+/* SNTP sync notification: lwIP calls this after a successful poll sets the
+ * clock. Flip sys.time.valid so subscribers (e.g. the lcd status-bar clock)
+ * react without polling. Runs on the tcpip task context. */
+static void ntpSyncNotify(struct timeval*) {
+  updateTimeValid();
+}
+
 /* ---- NTP start/stop ---- */
 
 static void ntpStop(const char*) {
@@ -163,6 +170,11 @@ void ntpInit() {
     })");
     storageSet("s.ntp.version", NTP_VERSION);
   }
+
+  /* Fire updateTimeValid() on every successful background SNTP sync — the
+   * automatic poll calls settimeofday() inside lwIP, which we'd otherwise
+   * never hear about. */
+  esp_sntp_set_time_sync_notification_cb(ntpSyncNotify);
 
   netRegister(NET_EV_UPSTREAM_UP,   ntpStart);
   netRegister(NET_EV_UPSTREAM_DOWN, ntpStop);
