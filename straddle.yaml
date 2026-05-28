@@ -1,0 +1,14 @@
+# spangap-net — IP networking + TLS + NTP + mDNS.
+#
+# Split out of spangap-core in Phase 2 of the straddles plan. Firmware-only,
+# no browser half, not a UI activator. Pulled in by any straddle that needs
+# WiFi/TCP/UDP — RNS-over-TCP, AutoInterface UDP-multicast, HTTPS server,
+# OTA, ACME, etc. A LoRa- or ESPNOW-only node skips this entirely.
+schema_version: 1
+name: spangap/spangap-net
+prefix: net
+version: 0.1.0
+firmware: esp-idf
+platforms: [idf]
+requires:
+  - spangap/spangap-core

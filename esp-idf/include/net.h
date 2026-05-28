@@ -12,11 +12,11 @@
 #include <lwip/sockets.h>
 
 /* Compiler-define fallbacks for AP mode (survive factory reset).
- * AP SSID defaults to the project name (CONFIG_DIPTYCH_PROJECT_NAME) so a
+ * AP SSID defaults to the project name (CONFIG_SPANGAP_PROJECT_NAME) so a
  * fresh device on a new project doesn't broadcast a stale SSID from the
  * previously-flashed project. */
 #ifndef WIFI_AP_SSID
-#define WIFI_AP_SSID CONFIG_DIPTYCH_PROJECT_NAME
+#define WIFI_AP_SSID CONFIG_SPANGAP_PROJECT_NAME
 #endif
 #ifndef WIFI_AP_PASS
 #define WIFI_AP_PASS ""

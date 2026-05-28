@@ -13,7 +13,7 @@
 #include "cli.h"
 #include "its.h"
 #include "tls.h"
-#if CONFIG_DIPTYCH_LCD
+#if CONFIG_SPANGAP_LCD
 #include "lcd.h"   /* on-device Settings → Net → Wifi pane */
 #endif
 #include <lwip/sockets.h>
@@ -1341,7 +1341,7 @@ static void netCliCmd(const char* args) {
  * net owns its sub-domains: s.net.{hostname,*_port,mdns,wifi.*,dns.*}. */
 #define NET_VERSION 1
 
-#if CONFIG_DIPTYCH_LCD
+#if CONFIG_SPANGAP_LCD
 /* On-device Settings → Net → Wifi pane. Mirrors the browser's NetworkPanel with
  * the controls the simple lcdSetting* helpers can express; the STA known-network
  * list (an array with per-network DHCP/MAC editing) stays browser-only. Runs on
@@ -1367,10 +1367,10 @@ static void wifiSettingsPane(void* arg) {
 void netInit() {
   int v = storageGetInt("s.net.version", 0);
   if (v < NET_VERSION) {
-    /* hostname and AP SSID interpolate CONFIG_DIPTYCH_PROJECT_NAME so a fresh
+    /* hostname and AP SSID interpolate CONFIG_SPANGAP_PROJECT_NAME so a fresh
      * device tracks the project name instead of hardcoded legacy strings. */
     storageDefaultTree("s.net", R"({
-      "hostname": ")" CONFIG_DIPTYCH_PROJECT_NAME R"(",
+      "hostname": ")" CONFIG_SPANGAP_PROJECT_NAME R"(",
       "http_port":   80,
       "https_port":  443,
       "rtsp_port":   554,
@@ -1398,7 +1398,7 @@ void netInit() {
     {
       char host[32];
       storageGetStr("s.net.hostname", host, sizeof(host),
-                    CONFIG_DIPTYCH_PROJECT_NAME);
+                    CONFIG_SPANGAP_PROJECT_NAME);
       uint8_t mac[6] = {};
       esp_efuse_mac_get_default(mac);
       char apssid[40];
@@ -1414,7 +1414,7 @@ void netInit() {
   pmLockCreate(PM_NO_DEEP_SLEEP, "net", &netDeepLock);
   cliRegisterCmd("net", netCliCmd);
   cliRegisterCmd("ping", pingCliCmd);
-#if CONFIG_DIPTYCH_LCD
+#if CONFIG_SPANGAP_LCD
   lcdRegisterSettings("Net/Wifi", "Wifi", wifiSettingsPane);
 #endif
 

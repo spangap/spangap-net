@@ -1,0 +1,17 @@
+description: "spangap-net: IP networking + TLS + NTP + mDNS for spangap device apps."
+url: https://github.com/spangap/spangap-net
+version: "0.1.0"
+license: "Apache-2.0"
+targets:
+  - esp32s3
+dependencies:
+  idf:
+    version: ">=5.5"
+  # Cross-straddle deps (spangap-core, spangap-lcd) are declared in
+  # straddle.yaml's `requires:`, not here — they're satisfied at the consumer's
+  # build time by `spangap make`'s staging step (staging/components/<short>/
+  # picked up via EXTRA_COMPONENT_DIRS), so CMakeLists.txt's `REQUIRES` lines
+  # can use short, fork-friendly names. Listing them here too would
+  # double-stage them under the manager's namespaced form and cause
+  # duplicate-symbol link errors.
+  espressif/mdns: "^1.5.0"
