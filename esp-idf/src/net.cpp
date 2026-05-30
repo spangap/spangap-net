@@ -26,6 +26,7 @@
 #include "lwip/ip4_addr.h"
 #include <cstring>
 #include <cstdio>
+#include <string>
 #include "esp_heap_caps.h"
 #include "esp_random.h"
 #include "esp_mac.h"
@@ -1277,12 +1278,144 @@ static void pingCliCmd(const char* args) {
 
 /* ---- Public API ---- */
 
+/* Find the index of a known STA network by SSID, or -1. */
+static int staNetFindBySsid(const char* ssid) {
+    int n = staNetCount();
+    for (int i = 0; i < n; i++) {
+        char s[33]; staNetGet(i, "ssid", s, sizeof(s));
+        if (strcmp(s, ssid) == 0) return i;
+    }
+    return -1;
+}
+
+/* Tokenise `in` into outv[], in-place into `scratch` (NUL-separated). Tokens
+ * are whitespace-delimited; "..."-quoted runs include literal whitespace and
+ * are stored without the surrounding quotes. No escapes inside quotes.
+ *
+ * Returns:
+ *    >= 0  number of tokens parsed (≤ maxOut)
+ *      -1  bad quoting / scratch overflow
+ *      -2  more than maxOut tokens present */
+static int parseArgs(const char* in, char* scratch, size_t scratchLen,
+                     char* outv[], int maxOut) {
+    int argc = 0;
+    char* w = scratch;
+    char* end = scratch + scratchLen;
+    for (;;) {
+        while (*in == ' ' || *in == '\t') in++;
+        if (!*in) return argc;
+        if (argc >= maxOut) return -2;
+        outv[argc++] = w;
+        if (*in == '"') {
+            in++;
+            while (*in && *in != '"') {
+                if (w >= end - 1) return -1;
+                *w++ = *in++;
+            }
+            if (*in != '"') return -1;   /* unterminated */
+            in++;
+        } else {
+            while (*in && *in != ' ' && *in != '\t') {
+                if (w >= end - 1) return -1;
+                *w++ = *in++;
+            }
+        }
+        if (w >= end) return -1;
+        *w++ = '\0';
+    }
+}
+
 static void netCliCmd(const char* args) {
-    if (strcmp(args, "help") == 0) { cliPrintf("  %-*s WiFi control / status\n", CLI_HELP_COL, "net [up|down|down!]"); return; }
+    if (strcmp(args, "help") == 0) {
+        cliPrintf("  %-*s WiFi control / status\n", CLI_HELP_COL, "net [up|down|down!]");
+        cliPrintf("  %-*s save a WiFi network (quote spaces)\n", CLI_HELP_COL, "net add <ssid> [pass]");
+        cliPrintf("  %-*s force-join a known network\n", CLI_HELP_COL, "net join <ssid>");
+        cliPrintf("  %-*s remove + disconnect\n",     CLI_HELP_COL, "net delete <ssid>");
+        return;
+    }
     if (strcmp(args, "up") == 0) { netUp(); return; }
     if (strcmp(args, "down!") == 0) { netDown(true); return; }
     if (strcmp(args, "down") == 0) { netDown(); return; }
-    if (*args) { cliPrintf("usage: net [up|down|down!]\n"); return; }
+
+    if (strncmp(args, "add ", 4) == 0 || strcmp(args, "add") == 0) {
+        char scratch[160]; char* argv[2];
+        int n = parseArgs(args + 3, scratch, sizeof(scratch), argv, 2);
+        if (n == -1) { cliPrintf("  bad quoting (use \"...\" for spaces)\n"); return; }
+        if (n == -2) { cliPrintf("  too many arguments — quote spaces with \"...\"\n"); return; }
+        if (n < 1)   { cliPrintf("usage: net add <ssid> [<password>]\n"); return; }
+        const char* ssid = argv[0];
+        const char* pass = (n == 2) ? argv[1] : "";
+        if (!*ssid) { cliPrintf("usage: net add <ssid> [<password>]\n"); return; }
+        int idx = staNetFindBySsid(ssid);
+        if (idx < 0) idx = staNetCount();
+        char k[64];
+        snprintf(k, sizeof(k), "s.net.wifi.nets.%d.ssid", idx); storageSet(k, ssid);
+        snprintf(k, sizeof(k), "s.net.wifi.nets.%d.pass", idx); storageSet(k, pass);
+        cliPrintf("  saved '%s' at index %d%s\n", ssid, idx, *pass ? "" : " (open)");
+        return;
+    }
+
+    if (strncmp(args, "join ", 5) == 0 || strcmp(args, "join") == 0) {
+        char scratch[80]; char* argv[1];
+        int n = parseArgs(args + 4, scratch, sizeof(scratch), argv, 1);
+        if (n == -1) { cliPrintf("  bad quoting (use \"...\" for spaces)\n"); return; }
+        if (n == -2) { cliPrintf("  too many arguments — quote spaces with \"...\"\n"); return; }
+        if (n != 1)  { cliPrintf("usage: net join <ssid>\n"); return; }
+        const char* ssid = argv[0];
+        int idx = staNetFindBySsid(ssid);
+        if (idx < 0) {
+            cliPrintf("  unknown network '%s' — add it first with `net add`\n", ssid);
+            return;
+        }
+        cliPrintf("  joining '%s'…\n", ssid);
+        netDown(true);
+        netUp();
+        return;
+    }
+
+    if (strncmp(args, "delete ", 7) == 0 || strcmp(args, "delete") == 0) {
+        char scratch[80]; char* argv[1];
+        int n = parseArgs(args + 6, scratch, sizeof(scratch), argv, 1);
+        if (n == -1) { cliPrintf("  bad quoting (use \"...\" for spaces)\n"); return; }
+        if (n == -2) { cliPrintf("  too many arguments — quote spaces with \"...\"\n"); return; }
+        if (n != 1)  { cliPrintf("usage: net delete <ssid>\n"); return; }
+        const char* ssid = argv[0];
+        int idx = staNetFindBySsid(ssid);
+        if (idx < 0) { cliPrintf("  no such network: '%s'\n", ssid); return; }
+        int total = staNetCount();
+        /* Are we currently associated to it? If so, disconnect after removal. */
+        bool wasJoined = false;
+        if (wifiState != ST_OFF && wifiState != ST_AP) {
+            wifi_ap_record_t ap_info;
+            if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK &&
+                strcmp((const char*)ap_info.ssid, ssid) == 0) wasJoined = true;
+        }
+        /* Shift entries [idx+1, total-1] down, then drop the tail subtree. */
+        storageBegin();
+        for (int i = idx; i < total - 1; i++) {
+            char src[64], dst[64];
+            for (const char* f : { "ssid", "pass", "ip", "gw", "mask", "dns", "mac" }) {
+                snprintf(src, sizeof(src), "s.net.wifi.nets.%d.%s", i + 1, f);
+                snprintf(dst, sizeof(dst), "s.net.wifi.nets.%d.%s", i, f);
+                std::string v = storageGetStr(src, "");
+                if (v.empty()) storageUnset(dst);
+                else           storageSet(dst, v.c_str());
+            }
+        }
+        char tail[64];
+        snprintf(tail, sizeof(tail), "s.net.wifi.nets.%d", total - 1);
+        storageDeleteTree(tail);
+        storageEnd();
+        cliPrintf("  removed '%s' (%d remain)\n", ssid, total - 1);
+        if (wasJoined) {
+            cliPrintf("  disconnecting (was the current STA)…\n");
+            netDown(true);
+            netUp();
+        }
+        return;
+    }
+
+    if (*args) { cliPrintf("usage: net [up|down|down!|add|join|delete]\n"); return; }
 
     /* Show status — four states: down, connecting, up, going down */
     if (wifiState == ST_OFF) { cliPrintf("wifi: down\n"); return; }
