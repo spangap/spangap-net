@@ -1144,8 +1144,8 @@ static int pingRecvEchoReply(int sock, uint16_t wantId, uint16_t wantSeq, uint8_
 }
 
 static void pingCliCmd(const char* args) {
-    if (strcmp(args, "help") == 0) {
-        cliPrintf("  %-*s ICMP echo (default target=router, count=4)\n", CLI_HELP_COL, "ping [ip] [count]");
+    if (cliWantsHelp(args)) {
+        cliPrintf("%-*s ICMP echo (default target=router, count=4)\n", CLI_HELP_COL, "ping [ip] [count]");
         return;
     }
     if (!netIsUp()) {
@@ -1326,11 +1326,12 @@ static int parseArgs(const char* in, char* scratch, size_t scratchLen,
 }
 
 static void netCliCmd(const char* args) {
-    if (strcmp(args, "help") == 0) {
-        cliPrintf("  %-*s WiFi control / status\n", CLI_HELP_COL, "net [up|down|down!]");
-        cliPrintf("  %-*s save a WiFi network (quote spaces)\n", CLI_HELP_COL, "net add <ssid> [pass]");
-        cliPrintf("  %-*s force-join a known network\n", CLI_HELP_COL, "net join <ssid>");
-        cliPrintf("  %-*s remove + disconnect\n",     CLI_HELP_COL, "net delete <ssid>");
+    if (strcmp(args, "help") == 0) { cliPrintf("%-*s WiFi status; up/down/add/join/delete\n", CLI_HELP_COL, "net [...]"); return; }
+    if (cliWantsHelp(args)) {
+        cliPrintf("%-*s WiFi control / status\n", CLI_HELP_COL, "net [up|down|down!]");
+        cliPrintf("%-*s save a WiFi network (quote spaces)\n", CLI_HELP_COL, "net add <ssid> [pass]");
+        cliPrintf("%-*s force-join a known network\n", CLI_HELP_COL, "net join <ssid>");
+        cliPrintf("%-*s remove + disconnect\n",     CLI_HELP_COL, "net delete <ssid>");
         return;
     }
     if (strcmp(args, "up") == 0) { netUp(); return; }
@@ -1340,8 +1341,8 @@ static void netCliCmd(const char* args) {
     if (strncmp(args, "add ", 4) == 0 || strcmp(args, "add") == 0) {
         char scratch[160]; char* argv[2];
         int n = parseArgs(args + 3, scratch, sizeof(scratch), argv, 2);
-        if (n == -1) { cliPrintf("  bad quoting (use \"...\" for spaces)\n"); return; }
-        if (n == -2) { cliPrintf("  too many arguments — quote spaces with \"...\"\n"); return; }
+        if (n == -1) { cliPrintf("bad quoting (use \"...\" for spaces)\n"); return; }
+        if (n == -2) { cliPrintf("too many arguments — quote spaces with \"...\"\n"); return; }
         if (n < 1)   { cliPrintf("usage: net add <ssid> [<password>]\n"); return; }
         const char* ssid = argv[0];
         const char* pass = (n == 2) ? argv[1] : "";
@@ -1351,23 +1352,23 @@ static void netCliCmd(const char* args) {
         char k[64];
         snprintf(k, sizeof(k), "s.net.wifi.nets.%d.ssid", idx); storageSet(k, ssid);
         snprintf(k, sizeof(k), "s.net.wifi.nets.%d.pass", idx); storageSet(k, pass);
-        cliPrintf("  saved '%s' at index %d%s\n", ssid, idx, *pass ? "" : " (open)");
+        cliPrintf("saved '%s' at index %d%s\n", ssid, idx, *pass ? "" : " (open)");
         return;
     }
 
     if (strncmp(args, "join ", 5) == 0 || strcmp(args, "join") == 0) {
         char scratch[80]; char* argv[1];
         int n = parseArgs(args + 4, scratch, sizeof(scratch), argv, 1);
-        if (n == -1) { cliPrintf("  bad quoting (use \"...\" for spaces)\n"); return; }
-        if (n == -2) { cliPrintf("  too many arguments — quote spaces with \"...\"\n"); return; }
+        if (n == -1) { cliPrintf("bad quoting (use \"...\" for spaces)\n"); return; }
+        if (n == -2) { cliPrintf("too many arguments — quote spaces with \"...\"\n"); return; }
         if (n != 1)  { cliPrintf("usage: net join <ssid>\n"); return; }
         const char* ssid = argv[0];
         int idx = staNetFindBySsid(ssid);
         if (idx < 0) {
-            cliPrintf("  unknown network '%s' — add it first with `net add`\n", ssid);
+            cliPrintf("unknown network '%s' — add it first with `net add`\n", ssid);
             return;
         }
-        cliPrintf("  joining '%s'…\n", ssid);
+        cliPrintf("joining '%s'…\n", ssid);
         netDown(true);
         netUp();
         return;
@@ -1376,12 +1377,12 @@ static void netCliCmd(const char* args) {
     if (strncmp(args, "delete ", 7) == 0 || strcmp(args, "delete") == 0) {
         char scratch[80]; char* argv[1];
         int n = parseArgs(args + 6, scratch, sizeof(scratch), argv, 1);
-        if (n == -1) { cliPrintf("  bad quoting (use \"...\" for spaces)\n"); return; }
-        if (n == -2) { cliPrintf("  too many arguments — quote spaces with \"...\"\n"); return; }
+        if (n == -1) { cliPrintf("bad quoting (use \"...\" for spaces)\n"); return; }
+        if (n == -2) { cliPrintf("too many arguments — quote spaces with \"...\"\n"); return; }
         if (n != 1)  { cliPrintf("usage: net delete <ssid>\n"); return; }
         const char* ssid = argv[0];
         int idx = staNetFindBySsid(ssid);
-        if (idx < 0) { cliPrintf("  no such network: '%s'\n", ssid); return; }
+        if (idx < 0) { cliPrintf("no such network: '%s'\n", ssid); return; }
         int total = staNetCount();
         /* Are we currently associated to it? If so, disconnect after removal. */
         bool wasJoined = false;
@@ -1406,9 +1407,9 @@ static void netCliCmd(const char* args) {
         snprintf(tail, sizeof(tail), "s.net.wifi.nets.%d", total - 1);
         storageDeleteTree(tail);
         storageEnd();
-        cliPrintf("  removed '%s' (%d remain)\n", ssid, total - 1);
+        cliPrintf("removed '%s' (%d remain)\n", ssid, total - 1);
         if (wasJoined) {
-            cliPrintf("  disconnecting (was the current STA)…\n");
+            cliPrintf("disconnecting (was the current STA)…\n");
             netDown(true);
             netUp();
         }
@@ -1435,9 +1436,9 @@ static void netCliCmd(const char* args) {
         char ip[16], mask[16];
         esp_ip4addr_ntoa(&ip_info.ip, ip, sizeof(ip));
         esp_ip4addr_ntoa(&ip_info.netmask, mask, sizeof(mask));
-        cliPrintf("  SSID:    %s\n", ssid);
-        cliPrintf("  IP:      %s\n", ip);
-        cliPrintf("  netmask: %s\n", mask);
+        cliPrintf("SSID:    %s\n", ssid);
+        cliPrintf("IP:      %s\n", ip);
+        cliPrintf("netmask: %s\n", mask);
     } else {
         cliPrintf("wifi: %s - %s\n\n", goingDown ? "going down" : "up", elapsed);
         wifi_ap_record_t ap_info;
@@ -1455,19 +1456,19 @@ static void netCliCmd(const char* args) {
         esp_ip4addr_ntoa(&dns1.ip.u_addr.ip4, dns1s, sizeof(dns1s));
         esp_netif_get_dns_info(sta_netif, ESP_NETIF_DNS_BACKUP, &dns2);
         esp_ip4addr_ntoa(&dns2.ip.u_addr.ip4, dns2s, sizeof(dns2s));
-        cliPrintf("  SSID:    %s\n", ssid);
-        cliPrintf("  IP:      %s\n", ip);
-        cliPrintf("  router:  %s\n", gw);
-        cliPrintf("  netmask: %s\n", mask);
+        cliPrintf("SSID:    %s\n", ssid);
+        cliPrintf("IP:      %s\n", ip);
+        cliPrintf("router:  %s\n", gw);
+        cliPrintf("netmask: %s\n", mask);
         if (strcmp(dns2s, "0.0.0.0") != 0)
-            cliPrintf("  DNS:     %s, %s\n", dns1s, dns2s);
+            cliPrintf("DNS:     %s, %s\n", dns1s, dns2s);
         else
-            cliPrintf("  DNS:     %s\n", dns1s);
+            cliPrintf("DNS:     %s\n", dns1s);
     }
     char inBuf[16], outBuf[16];
     fmtSize(trafficIn, inBuf, sizeof(inBuf));
     fmtSize(trafficOut, outBuf, sizeof(outBuf));
-    cliPrintf("  traffic: in %s, out %s\n", inBuf, outBuf);
+    cliPrintf("traffic: in %s, out %s\n", inBuf, outBuf);
 }
 
 /* Module config version. Bump when adding/changing defaults. See duckdns.cpp.

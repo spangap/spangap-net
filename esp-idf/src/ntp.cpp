@@ -107,7 +107,7 @@ static void ntpOnCfg(const char* key) {
 /* ---- CLI: date, date wait ---- */
 
 static void cmdDateWait(const char* a) {
-  if (strcmp(a, "help") == 0) { cliPrintf("  %-*s wait for valid date/time\n", CLI_HELP_COL, "date wait [timeout_secs]"); return; }
+  if (cliWantsHelp(a)) { cliPrintf("%-*s wait for valid date/time\n", CLI_HELP_COL, "date wait [timeout_secs]"); return; }
   if (timeValid()) return;
   int timeout = *a ? atoi(a) : 60;
   pm_lock_handle_t lock = nullptr;
@@ -129,7 +129,7 @@ static void cmdDateWait(const char* a) {
 }
 
 static void cmdDate(const char* a) {
-  if (strcmp(a, "help") == 0) { cliPrintf("  %-*s show or set date/time\n", CLI_HELP_COL, "date [wait] [yyyymmddhhmmss]"); return; }
+  if (cliWantsHelp(a)) { cliPrintf("%-*s show or set date/time\n", CLI_HELP_COL, "date [wait] [yyyymmddhhmmss]"); return; }
   if (!*a) {
     struct timeval tv;
     gettimeofday(&tv, NULL);

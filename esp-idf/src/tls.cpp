@@ -306,13 +306,13 @@ void tlsInit() {
 
     /* cert CLI commands */
     cliRegisterCmd("cert self-signed", [](const char* a) {
-        if (strcmp(a, "help") == 0) { cliPrintf("  %-*s generate self-signed cert (if none exists)\n", CLI_HELP_COL, "cert self-signed"); return; }
+        if (cliWantsHelp(a)) { cliPrintf("%-*s generate self-signed cert (if none exists)\n", CLI_HELP_COL, "cert self-signed"); return; }
         std::string existing;
-        if (stateRead("tls_cert", existing)) { cliPrintf("  certificate already exists\n"); return; }
+        if (stateRead("tls_cert", existing)) { cliPrintf("certificate already exists\n"); return; }
         tlsRegenCert();
     });
     cliRegisterCmd("cert delete", [](const char* a) {
-        if (strcmp(a, "help") == 0) { cliPrintf("  %-*s delete TLS certificate\n", CLI_HELP_COL, "cert delete"); return; }
+        if (cliWantsHelp(a)) { cliPrintf("%-*s delete TLS certificate\n", CLI_HELP_COL, "cert delete"); return; }
         fs_remove(fsStatePath("/tls_cert.pem").c_str());
         fs_remove(fsStatePath("/tls_key.pem").c_str());
         if (ready) {
@@ -324,31 +324,27 @@ void tlsInit() {
             mbedtls_ssl_config_init(&conf);
             ready = false;
         }
-        cliPrintf("  certificate deleted\n");
+        cliPrintf("certificate deleted\n");
     });
     cliRegisterCmd("cert", [](const char* a) {
-        if (strcmp(a, "help") == 0) {
-            cliPrintf("  %-*s show certificate info\n", CLI_HELP_COL, "cert");
-            cliPrintf("  %-*s generate self-signed cert\n", CLI_HELP_COL, "cert self-signed");
-            cliPrintf("  %-*s delete certificate\n", CLI_HELP_COL, "cert delete");
-            cliPrintf("  %-*s get/renew ACME cert\n", CLI_HELP_COL, "cert acme [days]");
-            return;
-        }
+        /* Subcommands (`cert self-signed`, `cert delete`, `acme`) are registered
+         * separately and list their own one-liners — keep this to the cert itself. */
+        if (cliWantsHelp(a)) { cliPrintf("%-*s show TLS certificate info\n", CLI_HELP_COL, "cert"); return; }
         std::string certPem;
-        if (!stateRead("tls_cert", certPem)) { cliPrintf("  no TLS certificate\n"); return; }
+        if (!stateRead("tls_cert", certPem)) { cliPrintf("no TLS certificate\n"); return; }
         mbedtls_x509_crt crt;
         mbedtls_x509_crt_init(&crt);
         if (mbedtls_x509_crt_parse(&crt, (const uint8_t*)certPem.c_str(), certPem.size()) != 0) {
-            cliPrintf("  certificate parse error\n");
+            cliPrintf("certificate parse error\n");
             mbedtls_x509_crt_free(&crt);
             return;
         }
         char buf[256];
         mbedtls_x509_dn_gets(buf, sizeof(buf), &crt.issuer);
-        cliPrintf("  issuer:  %s\n", buf);
+        cliPrintf("issuer:  %s\n", buf);
         mbedtls_x509_dn_gets(buf, sizeof(buf), &crt.subject);
-        cliPrintf("  subject: %s\n", buf);
-        cliPrintf("  expires: %04d-%02d-%02d\n",
+        cliPrintf("subject: %s\n", buf);
+        cliPrintf("expires: %04d-%02d-%02d\n",
                   crt.valid_to.year, crt.valid_to.mon, crt.valid_to.day);
         time_t now = time(nullptr);
         if (now > 1735689600) {
@@ -357,11 +353,11 @@ void tlsInit() {
             expiry.tm_mon = crt.valid_to.mon - 1;
             expiry.tm_mday = crt.valid_to.day;
             time_t expiryTime = mktime(&expiry);
-            cliPrintf("  days left: %d\n", (int)((expiryTime - now) / 86400));
+            cliPrintf("days left: %d\n", (int)((expiryTime - now) / 86400));
         }
         bool selfSigned = (crt.issuer_raw.len == crt.subject_raw.len &&
                            memcmp(crt.issuer_raw.p, crt.subject_raw.p, crt.issuer_raw.len) == 0);
-        cliPrintf("  type: %s\n", selfSigned ? "self-signed" : "CA-signed");
+        cliPrintf("type: %s\n", selfSigned ? "self-signed" : "CA-signed");
         mbedtls_x509_crt_free(&crt);
     });
 }
