@@ -380,47 +380,54 @@ static int netDialSync(const char* host, uint16_t port, uint32_t timeoutMs) {
 
     char portStr[8];
     snprintf(portStr, sizeof(portStr), "%u", (unsigned)port);
+    /* AF_UNSPEC so a host with both A and AAAA records is reachable — getaddrinfo
+     * orders the candidates per RFC 6724 (IPv6 preferred when we have a global
+     * v6 source address), and we try them in turn until one connects. This is
+     * what lets us reach v6-only hosts (e.g. play.rop.nl off-VPN). */
     struct addrinfo hints = {};
-    hints.ai_family = AF_INET;
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     struct addrinfo* res = nullptr;
     if (getaddrinfo(host, portStr, &hints, &res) != 0 || !res) {
         warn("dial: DNS failed for %s\n", host);
         return -1;
     }
-    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (fd < 0) { freeaddrinfo(res); return -1; }
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
-    int yes = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
 
-    int rc = connect(fd, res->ai_addr, res->ai_addrlen);
+    int fd = -1;
+    for (struct addrinfo* ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+        int yes = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+
+        int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (rc != 0 && errno != EINPROGRESS) {
+            warn("dial: connect %s:%u immediate fail (af=%d errno %d)\n",
+                 host, port, ai->ai_family, errno);
+            close(fd); fd = -1; continue;
+        }
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(fd, &wfds);
+        struct timeval tv = { (long)(timeoutMs / 1000), (long)((timeoutMs % 1000) * 1000) };
+        int sel = select(fd + 1, nullptr, &wfds, nullptr, &tv);
+        if (sel <= 0) {
+            warn("dial: connect %s:%u timeout (af=%d)\n", host, port, ai->ai_family);
+            close(fd); fd = -1; continue;
+        }
+        int soerr = 0;
+        socklen_t soerrLen = sizeof(soerr);
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &soerrLen);
+        if (soerr != 0) {
+            warn("dial: connect %s:%u failed (af=%d errno %d)\n",
+                 host, port, ai->ai_family, soerr);
+            close(fd); fd = -1; continue;
+        }
+        info("dial: connected %s:%u (af=%d fd=%d)\n", host, port, ai->ai_family, fd);
+        break;
+    }
     freeaddrinfo(res);
-    if (rc != 0 && errno != EINPROGRESS) {
-        warn("dial: connect %s:%u immediate fail (errno %d)\n", host, port, errno);
-        close(fd);
-        return -1;
-    }
-
-    fd_set wfds;
-    FD_ZERO(&wfds);
-    FD_SET(fd, &wfds);
-    struct timeval tv = { (long)(timeoutMs / 1000), (long)((timeoutMs % 1000) * 1000) };
-    int sel = select(fd + 1, nullptr, &wfds, nullptr, &tv);
-    if (sel <= 0) {
-        warn("dial: connect %s:%u timeout\n", host, port);
-        close(fd);
-        return -1;
-    }
-    int soerr = 0;
-    socklen_t soerrLen = sizeof(soerr);
-    getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &soerrLen);
-    if (soerr != 0) {
-        warn("dial: connect %s:%u failed (errno %d)\n", host, port, soerr);
-        close(fd);
-        return -1;
-    }
-    info("dial: connected %s:%u (fd=%d)\n", host, port, fd);
     return fd;
 }
 
@@ -469,9 +476,19 @@ static void wifi_event_handler(void* arg, esp_event_base_t base,
                                int32_t id, void* data) {
   if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED)
     staConnected = false;
+  else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_CONNECTED) {
+    /* Kick off IPv6: forms the link-local now and, with SLAAC
+     * (CONFIG_LWIP_IPV6_AUTOCONFIG), a global address from router RAs — needed
+     * to reach v6-only hosts like play.rop.nl off-VPN. */
+    esp_netif_create_ip6_linklocal(sta_netif);
+  }
   else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
     staConnected = true;
     xSemaphoreGive(wifiConnectedSem);
+  }
+  else if (base == IP_EVENT && id == IP_EVENT_GOT_IP6) {
+    ip_event_got_ip6_t* e = (ip_event_got_ip6_t*)data;
+    info("net: IPv6 " IPV6STR "\n", IPV62STR(e->ip6_info.ip));
   }
 }
 
@@ -484,6 +501,7 @@ static void wifiNetifInit() {
   ap_netif  = esp_netif_create_default_wifi_ap();
   esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, nullptr);
   esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, nullptr);
+  esp_event_handler_register(IP_EVENT, IP_EVENT_GOT_IP6, &wifi_event_handler, nullptr);
 }
 
 static void wifiHwStart(wifi_mode_t mode = WIFI_MODE_STA) {
