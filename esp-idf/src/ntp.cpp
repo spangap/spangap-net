@@ -36,10 +36,41 @@ static void ntpSyncNotify(struct timeval*) {
   updateTimeValid();
 }
 
-/* ---- NTP start/stop ---- */
+/* ---- NTP start/stop ----
+ *
+ * The SNTP engine should run iff upstream internet is up AND no local time
+ * authority has inhibited it (e.g. GPS, see ntpInhibit). s_up and s_running are
+ * owned by the net task; s_inhibited is written from any task and read by the
+ * net task. ntpEngineApply() is the single place that calls esp_sntp_init/stop
+ * and runs only in net-task context (UP/DOWN/POLL callbacks), so those calls
+ * never race across tasks. */
+static bool s_up        = false;   /* upstream internet up (net task) */
+static bool s_running   = false;   /* esp_sntp_init() in effect (net task) */
+static volatile bool s_inhibited = false;  /* set by ntpInhibit() from any task */
 
-static void ntpStop(const char*) {
-  esp_sntp_stop();
+static void ntpEngineApply() {
+  bool want = s_up && !s_inhibited;
+  if (want == s_running) return;
+  if (want) {
+    static char server[64];  /* esp_sntp_setservername stores pointer, not copy */
+    storageGetStr("s.ntp.server", server, sizeof(server));
+    ntpApplyTimezone();
+    esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, server);
+    esp_sntp_init();
+    s_running = true;
+    char tz[64];
+    storageGetStr("s.ntp.tz", tz, sizeof(tz));
+    info("ntp: %s TZ=%s\n", server, tz);
+  } else {
+    esp_sntp_stop();
+    s_running = false;
+    info("ntp: stopped (%s)\n", s_inhibited ? "GPS time" : "upstream down");
+  }
+}
+
+void ntpInhibit(bool inhibit) {
+  s_inhibited = inhibit;   /* net task reconciles on its next poll (≤~10 ms) */
 }
 
 void ntpApplyTimezone() {
@@ -71,19 +102,11 @@ void ntpApplyTimezone() {
   }
 }
 
-static void ntpStart(const char*) {
-  static char server[64];  /* esp_sntp_setservername stores pointer, not copy */
-  storageGetStr("s.ntp.server", server, sizeof(server));
-  ntpApplyTimezone();
-
-  esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
-  esp_sntp_setservername(0, server);
-  esp_sntp_init();
-
-  char tz[64];
-  storageGetStr("s.ntp.tz", tz, sizeof(tz));
-  info("ntp: %s TZ=%s\n", server, tz);
-}
+static void ntpOnUp(const char*)   { s_up = true;  ntpEngineApply(); }
+static void ntpOnDown(const char*) { s_up = false; ntpEngineApply(); }
+/* Cheap reconcile (two bool compares) on each net poll, so an ntpInhibit()
+ * flip from another task takes effect without its own event. */
+static void ntpOnPoll(const char*) { ntpEngineApply(); }
 
 /* ---- NET_EV_CFG_CHANGED: timezone + time set ---- */
 
@@ -176,8 +199,9 @@ void ntpInit() {
    * never hear about. */
   esp_sntp_set_time_sync_notification_cb(ntpSyncNotify);
 
-  netRegister(NET_EV_UPSTREAM_UP,   ntpStart);
-  netRegister(NET_EV_UPSTREAM_DOWN, ntpStop);
+  netRegister(NET_EV_UPSTREAM_UP,   ntpOnUp);
+  netRegister(NET_EV_UPSTREAM_DOWN, ntpOnDown);
+  netRegister(NET_EV_POLL,          ntpOnPoll);
   netRegister(NET_EV_CFG_CHANGED,   ntpOnCfg);
 
   cliRegisterCmd("date wait", cmdDateWait);
