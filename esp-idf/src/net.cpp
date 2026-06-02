@@ -253,6 +253,15 @@ static void netPollOnce() {
         }
     }
 
+    /* This is the net task's real block point, and it is timeout-driven, not
+     * notify-driven: select() (and the idle vTaskDelay) wake on socket activity
+     * or the 10ms tick, never on a task notify — so itsPoll's auto-boost is
+     * never dropped here. The connected loop otherwise blocks only in select(),
+     * so a CPU_FREQ_MAX count carried in from the OFF->up notify-wake would pin
+     * 240 MHz for the whole time WiFi stays up. Release it before the block: the
+     * steady proxy path rides the DFS floor (heavy throughput would opt into a
+     * manual pmBoost()). Idempotent — a no-op once the count is gone. */
+    pmBoostAuto(false);
     if (maxFd >= 0) {
         struct timeval tv = { 0, 10000 };
         select(maxFd + 1, &rfds, NULL, NULL, &tv);
