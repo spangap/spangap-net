@@ -46,9 +46,14 @@ DMA bug (espressif/esp-idf#12689) corrupts payloads otherwise.
 
 ## `ntp.cpp` — non-blocking NTP
 
-Built on `esp_sntp`. Caches `s.time.zones.json` (IANA → POSIX) under
-`/fixed`; `update-zones.py` (in `spangap-core/scripts/`) refreshes the
-cache. Exposes the `date` CLI.
+Built on `esp_sntp`. The IANA → POSIX timezone map ships as a plain
+user-state file at `<stateDir>/timezones.json` (NOT a config subtree —
+this keeps the ~15 KB map out of `cfgRoot`/RAM). `ntpApplyTimezone()`
+parses it transiently on a timezone change, frees it immediately, and
+caches the one resolved POSIX string in `s.ntp.posix`. `update-zones.py`
+(in `spangap-core/scripts/`) regenerates the file; the browser refreshes
+it via HTTPS PUT to `/state/timezones.json` when GitHub's copy is newer.
+Exposes the `date` CLI.
 
 ## `spangap_mdns.cpp` — mDNS wrapper
 

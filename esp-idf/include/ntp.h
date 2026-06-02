@@ -4,8 +4,11 @@
 /** Register NTP net event callbacks. Call from main after netInit(). */
 void ntpInit();
 
-/** Apply s.ntp.tz / s.ntp.posix → TZ env. Safe to call as soon as
- *  storageLoad() has run; subsequent localtime() calls show local time. */
+/** Apply s.ntp.tz → TZ env. Uses the cached s.ntp.posix string if present,
+ *  else resolves the IANA name against the on-disk <stateDir>/timezones.json
+ *  DB (parsed transiently, not held in RAM) and caches the result. Safe to
+ *  call as soon as storageLoad() has run; subsequent localtime() calls show
+ *  local time. */
 void ntpApplyTimezone();
 
 /** Suspend/resume background SNTP polling. Used by an authoritative local time

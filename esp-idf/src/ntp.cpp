@@ -6,6 +6,7 @@
  */
 #include "ntp.h"
 #include "storage.h"
+#include "fs.h"
 #include "net.h"
 #include "cli.h"
 #include "pm.h"
@@ -18,6 +19,8 @@
 #include <time.h>
 #include <sys/time.h>
 #include "esp_sntp.h"
+#include "esp_heap_caps.h"
+#include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -73,23 +76,71 @@ void ntpInhibit(bool inhibit) {
   s_inhibited = inhibit;   /* net task reconciles on its next poll (≤~10 ms) */
 }
 
+/* Resolve the POSIX TZ string for an IANA name from the on-disk timezone DB.
+ *
+ * The IANA→POSIX map is large (~15 KB JSON, hundreds of zones) and is needed
+ * only on the rare timezone change, so it deliberately does NOT live in the
+ * config tree (cfgRoot) — that would keep it resident in RAM for the whole
+ * runtime. It's a plain file at <stateDir>/timezones.json (the browser
+ * refreshes it via an HTTPS PUT when GitHub's copy is newer). We parse it
+ * transiently here, pull the one string we need, and free the cJSON tree
+ * before returning — so nothing of it survives the call.
+ *
+ * Returns true and fills `out` on success; false if the file or zone is
+ * missing. `iana` is split on '/' (e.g. "America/Argentina/Buenos_Aires"
+ * descends three object levels). */
+static bool zoneLookup(const char* iana, char* out, size_t outLen) {
+  out[0] = '\0';
+  std::string path = fsStatePath("/timezones.json");
+  int fd = fs_open(path.c_str(), "rb");
+  if (fd < 0) return false;
+  fs_seek(fd, 0, SEEK_END);
+  long sz = fs_tell(fd);
+  fs_seek(fd, 0, SEEK_SET);
+  if (sz <= 0 || sz > 256 * 1024) { fs_close(fd); return false; }
+  char* buf = (char*)heap_caps_malloc(sz + 1, MALLOC_CAP_SPIRAM);
+  if (!buf) buf = (char*)malloc(sz + 1);
+  if (!buf) { fs_close(fd); return false; }
+  size_t rd = fs_read(buf, 1, sz, fd);
+  fs_close(fd);
+  buf[rd] = '\0';
+
+  cJSON* root = cJSON_Parse(buf);
+  free(buf);
+  if (!root) return false;
+
+  /* Walk the '/'-separated IANA path down the nested objects. */
+  cJSON* node = root;
+  std::string part;
+  for (const char* p = iana; node; p++) {
+    if (*p == '/' || *p == '\0') {
+      node = cJSON_GetObjectItemCaseSensitive(node, part.c_str());
+      part.clear();
+      if (*p == '\0') break;
+    } else {
+      part += *p;
+    }
+  }
+  if (cJSON_IsString(node) && node->valuestring)
+    snprintf(out, outLen, "%s", node->valuestring);
+  cJSON_Delete(root);
+  return out[0] != '\0';
+}
+
 void ntpApplyTimezone() {
   char iana[48];
   storageGetStr("s.ntp.tz", iana, sizeof(iana));
   if (!iana[0]) return;
 
-  /* Primary: use cached POSIX string (set by browser alongside s.ntp.tz) */
+  /* Primary: cached POSIX string from a previous resolve (tiny, lives in
+   * config). Invalidated by ntpOnCfg() whenever s.ntp.tz changes. */
   char posix[64];
   storageGetStr("s.ntp.posix", posix, sizeof(posix));
 
-  /* Fallback: look up from s.time.zones (flash-only, transparent via storageGetStr) */
-  if (!posix[0]) {
-    std::string key = "s.time.zones.";
-    for (const char* p = iana; *p; p++)
-      key += (*p == '/') ? '.' : *p;
-    storageGetStr(key.c_str(), posix, sizeof(posix));
-    if (posix[0]) storageSet("s.ntp.posix", posix);  /* cache for next boot */
-  }
+  /* Fallback: resolve from the on-disk timezone DB, then cache the result so
+   * subsequent boots skip the file parse. */
+  if (!posix[0] && zoneLookup(iana, posix, sizeof(posix)))
+    storageSet("s.ntp.posix", posix);
 
   if (posix[0]) {
     setenv("TZ", posix, 1);
@@ -112,6 +163,10 @@ static void ntpOnPoll(const char*) { ntpEngineApply(); }
 
 static void ntpOnCfg(const char* key) {
   if (strcmp(key, "s.ntp.tz") == 0) {
+    /* Drop the stale POSIX cache so ntpApplyTimezone() re-resolves the new
+     * zone from the on-disk DB. The browser now sends only s.ntp.tz; the
+     * device owns the IANA→POSIX lookup. */
+    storageSet("s.ntp.posix", "");
     ntpApplyTimezone();
   } else if (strcmp(key, "sys.time.set") == 0) {
     char buf[16];
@@ -181,16 +236,25 @@ static void cmdDate(const char* a) {
 /* ---- Init ---- */
 
 /* Module config version. Bump when adding/changing defaults. See duckdns.cpp. */
-#define NTP_VERSION 1
+#define NTP_VERSION 2
 
 void ntpInit() {
   int v = storageGetInt("s.ntp.version", 0);
   if (v < NTP_VERSION) {
     storageDefaultTree("s.ntp", R"({
-      "server": "pool.ntp.org",
-      "tz":     "",
-      "posix":  ""
+      "server":     "pool.ntp.org",
+      "tz":         "",
+      "posix":      "",
+      "zones_etag": ""
     })");
+    /* v1→v2: the IANA→POSIX map moved out of config storage to the loose
+     * file <stateDir>/timezones.json. On an OTA upgrade the legacy external
+     * blob is still on disk and scanExternals() would keep it resident in
+     * cfgRoot forever — evict it so the map is truly out of RAM. The new
+     * loose file ships via the factory image / browser PUT. No-op when the
+     * key is absent (e.g. fresh devices). The cached s.ntp.posix from v1
+     * survives, so TZ stays applied even before the new file arrives. */
+    if (v < 2) storageDeleteTree("s.time.zones");
     storageSet("s.ntp.version", NTP_VERSION);
   }
 
@@ -207,6 +271,11 @@ void ntpInit() {
   cliRegisterCmd("date wait", cmdDateWait);
   cliRegisterCmd("date", cmdDate);
 
-  /* Publish initial time validity (timezone applied early in app_main) */
+  /* Publish initial time validity, then switch to the persisted timezone so
+   * every subsequent log line is timestamped local. ntpApplyTimezone() used
+   * to be a separate call the consumer made in app_main right after ntpInit();
+   * folding it here lets the auto-init dispatcher run NTP end-to-end with no
+   * consumer call site. */
   updateTimeValid();
+  ntpApplyTimezone();
 }
