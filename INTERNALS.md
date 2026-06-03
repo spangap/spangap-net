@@ -64,9 +64,11 @@ Wrapper around ESP-IDF's `mdns` component. The header is named
 
 Phase-2 split from `spangap-core`. Two reasons:
 
-1. **LoRa-only / ESP-NOW-only nodes don't need an IP stack.** Keeping
-   net out of `spangap-core` lets those firmware images skip
-   `~150 KB` of lwIP code and the WiFi blob's RAM footprint.
+1. **The IP stack is an optional capability, not part of the foundation.**
+   An image that doesn't enable net shouldn't carry it. Keeping net out of
+   `spangap-core` lets such a build skip `~150 KB` of lwIP code and the WiFi
+   blob's RAM footprint — `--no-net` drops net and everything that
+   hard-requires it.
 2. **Several add-ons (acme, duckdns, upnp, wg, ota) want net but not
    the rest of `spangap-core`'s storage / log / fs heaviness.** They
    express that with `requires: [spangap/spangap-net]`.

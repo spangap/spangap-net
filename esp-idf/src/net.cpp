@@ -11,6 +11,7 @@
 #include "pm.h"
 #include "log.h"
 #include "cli.h"
+#include "fs.h"
 #include "its.h"
 #include "tls.h"
 #if CONFIG_SPANGAP_LCD
@@ -145,11 +146,15 @@ static net_endpoint_t* epFindByKey(const char* nvsKey) {
     return nullptr;
 }
 
-/* ITS aux callback: tasks register TCP endpoints */
-static void netOnAux(TaskHandle_t sender, const void* data, size_t len) {
-    if (len < sizeof(net_port_msg_t)) return;
-    auto* msg = (const net_port_msg_t*)data;
-    net_endpoint_t* ep = epFindByKey(msg->nvsKey);
+/* Register (or refresh) a TCP endpoint owned by `task`. Two callers: the aux
+ * path below, where a task registers its own port, and netRegisterCorePorts(),
+ * where net exposes the always-present core services (cli/log) on their behalf
+ * — those tasks have no compile-time knowledge of TCP, so the dependency runs
+ * net → core, never the reverse. */
+static void epRegister(TaskHandle_t task, uint16_t itsPort, const char* nvsKey,
+                       int defaultPort, bool tls, bool keepAlive, int backlog) {
+    if (!task) return;
+    net_endpoint_t* ep = epFindByKey(nvsKey);
     if (!ep) {
         if (netEpCount >= NET_MAX_ENDPOINTS) return;
         ep = &netEps[netEpCount++];
@@ -157,14 +162,48 @@ static void netOnAux(TaskHandle_t sender, const void* data, size_t len) {
         ep->serverFd = -1;
         ep->port = 0;
     }
-    ep->task = sender;
-    ep->itsPort = msg->itsPort;
-    safeStrncpy(ep->nvsKey, msg->nvsKey, sizeof(ep->nvsKey));
-    ep->defaultPort = msg->defaultPort;
-    ep->tls = msg->tls;
+    ep->task = task;
+    ep->itsPort = itsPort;
+    safeStrncpy(ep->nvsKey, nvsKey, sizeof(ep->nvsKey));
+    ep->defaultPort = defaultPort;
+    ep->tls = tls;
     ep->tcpNoDelay = true;
-    ep->keepAlive = msg->keepAlive;
-    ep->backlog = msg->backlog > 0 ? msg->backlog : 4;
+    ep->keepAlive = keepAlive;
+    ep->backlog = backlog > 0 ? backlog : 4;
+}
+
+/* ITS aux callback: tasks register TCP endpoints */
+static void netOnAux(TaskHandle_t sender, const void* data, size_t len) {
+    if (len < sizeof(net_port_msg_t)) return;
+    auto* msg = (const net_port_msg_t*)data;
+    epRegister(sender, msg->itsPort, msg->nvsKey, msg->defaultPort,
+               msg->tls, msg->keepAlive, msg->backlog);
+}
+
+/* Expose the core platform services (CLI + log) over TCP. They live in
+ * spangap-core and know nothing about net; net resolves their tasks by name
+ * (ITS names them "cli"/"log") and registers their endpoints. Both default to
+ * port 0 (off) in net's config tree — exposed only when the user sets
+ * s.net.cli_port / s.net.log_port. */
+static void netRegisterCorePorts() {
+    epRegister(xTaskGetHandle("cli"), CLI_PORT_TCP, "cli_port", 0,
+               /*tls=*/false, /*keepAlive=*/false, /*backlog=*/0);
+    epRegister(xTaskGetHandle("log"), LOG_PORT_TCP, "log_port", 0,
+               /*tls=*/false, /*keepAlive=*/false, /*backlog=*/0);
+}
+
+/* Run /state/net_up whenever the device reaches a real upstream. Net policy,
+ * not a consumer's: it fires off NET_EV_UPSTREAM_UP, which only net knows
+ * about, so net owns the boot hook and every net device gets it without
+ * wiring anything in app_main. The script is run on its own task because
+ * cliRunFile blocks until the script's commands drain. */
+static void netUpScriptTask(void*) {
+    cliRunFile(fsStatePath("/net_up").c_str());
+    killSelf();
+}
+
+static void netOnUpstreamUp(const char*) {
+    spawnTask(netUpScriptTask, "net_up", 4096, nullptr, 1, 1);
 }
 
 static void epOpenPort(net_endpoint_t& ep) {
@@ -901,6 +940,14 @@ static void netTaskFn(void* arg) {
   itsServerOnDisconnect(NET_PORT_TCP_DIAL, netOnDialDisconnect);
   itsOnAux(NET_PORT_REG_PORT, netOnAux);
   itsOnAux(NET_CMD_PORT, netCmdHandler);
+
+  /* Pre-register the core CLI/log TCP endpoints. spangapInit() brought those
+   * tasks up before this straddle's init hook ran, so xTaskGetHandle resolves
+   * them now; epOpenAll() opens them (if configured) once net is up. */
+  netRegisterCorePorts();
+
+  /* Run /state/net_up on every upstream-up — net policy, not the consumer's. */
+  netRegister(NET_EV_UPSTREAM_UP, netOnUpstreamUp);
 
   /* Net's own config: re-open endpoints when ports/host change. */
   storageSubscribeChanges("s.net.", ON_CHANGE {

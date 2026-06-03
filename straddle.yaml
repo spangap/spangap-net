@@ -10,23 +10,20 @@ prefix: net
 version: 0.1.0
 firmware: esp-idf
 platforms: [idf]
-requires:
-  - spangap/spangap-core
+# spangap-core is implicit (the empty-prefix platform foundation) — not listed.
 optional_requires:
   # net.cpp / spangap_mdns.cpp register on-device Settings panes via
   # spangap-lcd's lcdSetting* helpers, gated on CONFIG_SPANGAP_LCD.
   - spangap/spangap-lcd
 # Auto-init: the net foundation the buildable used to bring up by hand in
 # app_main is now folded into the generated spangapInitStraddles() dispatcher.
-# These sit in the network-bring-up band (<50) so they run before every
-# service/app-layer straddle. ntpInit() ends by applying the persisted
-# timezone, so logs switch from UTC to local time from this point on.
+# net is in the dispatcher's platform band (right after core, see spangap-inside
+# PLATFORM_ORDER), so the IP stack is up before every service/app straddle —
+# they need not order themselves against it. These four fire in listed order:
+# TLS, then the netif/WiFi, then NTP (which ends by applying the persisted
+# timezone, so logs switch UTC→local from here), then mDNS.
 init:
   - call: tlsInit
-    order: 10
   - call: netInit
-    order: 20
   - call: ntpInit
-    order: 30
   - call: mdnsInit
-    order: 40

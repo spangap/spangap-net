@@ -268,6 +268,15 @@ void ntpInit() {
   netRegister(NET_EV_POLL,          ntpOnPoll);
   netRegister(NET_EV_CFG_CHANGED,   ntpOnCfg);
 
+  /* A local time authority (e.g. a GPS receiver) parks SNTP by writing
+   * sys.time.ext=1 on the storage state bus — and releases it with 0. Driving
+   * it through storage instead of a direct ntpInhibit() call means the time
+   * source needs no compile-time dependency on net: a net-less image just has
+   * no subscriber, and the source owns the clock outright. */
+  storageSubscribeChanges("sys.time.ext", ON_CHANGE {
+    ntpInhibit(atoi(val) != 0);
+  });
+
   cliRegisterCmd("date wait", cmdDateWait);
   cliRegisterCmd("date", cmdDate);
 
