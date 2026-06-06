@@ -39,18 +39,6 @@ static void mdnsStop(const char*) {
 
 #define MDNS_VERSION 1
 
-#if CONFIG_SPANGAP_LCD
-#include "lcd.h"
-/* On-device Settings → Net → mDNS pane. The browser exposes a single toggle; on
- * device we surface the actual advertised ports (0 = don't advertise). */
-static void mdnsSettingsPane(void* arg) {
-    lv_obj_t* p = static_cast<lv_obj_t*>(arg);
-    lcdSettingSection(p, "mDNS");
-    lcdSettingText   (p, "HTTP port",  "s.net.mdns.http");
-    lcdSettingText   (p, "HTTPS port", "s.net.mdns.https");
-}
-#endif
-
 void mdnsInit() {
     if (storageGetInt("s.net.mdns_version", 0) < MDNS_VERSION) {
         storageDefault("s.net.mdns.http", 80);
@@ -60,8 +48,4 @@ void mdnsInit() {
 
     netRegister(NET_EV_UP,   mdnsStart);
     netRegister(NET_EV_DOWN, mdnsStop);
-
-#if CONFIG_SPANGAP_LCD
-    lcdRegisterSettings("Net/mDNS", "mDNS", mdnsSettingsPane);
-#endif
 }

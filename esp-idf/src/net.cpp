@@ -14,9 +14,6 @@
 #include "fs.h"
 #include "its.h"
 #include "tls.h"
-#if CONFIG_SPANGAP_LCD
-#include "lcd.h"   /* on-device Settings → Net → Wifi pane */
-#endif
 #include <lwip/sockets.h>
 #include <lwip/netdb.h>
 #include <fcntl.h>
@@ -1549,29 +1546,6 @@ static void netCliCmd(const char* args) {
  * net owns its sub-domains: s.net.{hostname,*_port,mdns,wifi.*,dns.*}. */
 #define NET_VERSION 1
 
-#if CONFIG_SPANGAP_LCD
-/* On-device Settings → Net → Wifi pane. Mirrors the browser's NetworkPanel with
- * the controls the simple lcdSetting* helpers can express; the STA known-network
- * list (an array with per-network DHCP/MAC editing) stays browser-only. Runs on
- * the lcd task; storage keys must be static (the helpers store them by pointer). */
-static void wifiSettingsPane(void* arg) {
-  lv_obj_t* p = static_cast<lv_obj_t*>(arg);
-
-  lcdSettingSection(p, "WiFi");
-  lcdSettingSwitch (p, "Enable", "s.net.wifi.enable");
-  lcdSettingValue  (p, "Status", "wifi.sta.state");   /* live, ~1 Hz */
-  lcdSettingValue  (p, "SSID",   "wifi.sta.ssid");
-  lcdSettingValue  (p, "IP",     "wifi.sta.ip");
-  lcdSettingValue  (p, "Signal", "wifi.sta.rssi");
-
-  lcdSettingSection(p, "Access Point");
-  lcdSettingText   (p, "Name",     "s.net.wifi.ap.ssid");
-  lcdSettingText   (p, "Password", "s.net.wifi.ap.pass");
-  lcdSettingText   (p, "IP",       "s.net.wifi.ap.ip");
-  lcdSettingText   (p, "Netmask",  "s.net.wifi.ap.mask");
-}
-#endif
-
 void netInit() {
   int v = storageGetInt("s.net.version", 0);
   if (v < NET_VERSION) {
@@ -1622,9 +1596,6 @@ void netInit() {
   pmLockCreate(PM_NO_DEEP_SLEEP, "net", &netDeepLock);
   cliRegisterCmd("net", netCliCmd);
   cliRegisterCmd("ping", pingCliCmd);
-#if CONFIG_SPANGAP_LCD
-  lcdRegisterSettings("Net/Wifi", "Wifi", wifiSettingsPane);
-#endif
 
   for (int i = 0; i < NET_MAX_CLIENTS; i++) {
     netClients[i].fd = -1;
