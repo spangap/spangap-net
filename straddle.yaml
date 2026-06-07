@@ -11,11 +11,18 @@ version: 0.1.0
 firmware: esp-idf
 platforms: [idf]
 # spangap-core is implicit (the empty-prefix platform foundation) — not listed.
-optional_requires:
-  # On-device Settings panes (Net → Wifi, Net → mDNS) live in the
-  # esp-idf/conditional/spangap-lcd/ slice (built only when lcd is staged) and
-  # register via the when:-gated netLcdRegister / mdnsLcdRegister init hooks.
-  - spangap/spangap-lcd
+# Remote-access services ride on the IP stack: anything that pulls in net gets
+# ACME / UPnP / WireGuard / DuckDNS staged by default (each hard-requires net
+# anyway). They carry their own when:-gated init hooks, so a build that drops
+# one with `spangap build --without spangap/<name>` compiles away cleanly.
+# (The on-device Net Settings panes still register via the when: spangap/
+# spangap-lcd netLcdRegister / mdnsLcdRegister hooks below — they ride on
+# whoever staged lcd, no longer on a net-side install.)
+additional_installs:
+  - spangap/acme
+  - spangap/upnp
+  - spangap/wg
+  - spangap/duckdns
 # Auto-init: the net foundation the buildable used to bring up by hand in
 # app_main is now folded into the generated spangapInitStraddles() dispatcher.
 # net is in the dispatcher's platform band (right after core, see spangap-inside

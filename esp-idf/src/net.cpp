@@ -1549,10 +1549,11 @@ static void netCliCmd(const char* args) {
 void netInit() {
   int v = storageGetInt("s.net.version", 0);
   if (v < NET_VERSION) {
-    /* hostname and AP SSID interpolate CONFIG_SPANGAP_PROJECT_NAME so a fresh
-     * device tracks the project name instead of hardcoded legacy strings. */
+    /* hostname and AP SSID interpolate CONFIG_SPANGAP_FW_HOSTNAME (the
+     * straddle's default_hostname), so a fresh device seeds its mutable
+     * hostname from firmware identity instead of hardcoded legacy strings. */
     storageDefaultTree("s.net", R"({
-      "hostname": ")" CONFIG_SPANGAP_PROJECT_NAME R"(",
+      "hostname": ")" CONFIG_SPANGAP_FW_HOSTNAME R"(",
       "http_port":   80,
       "https_port":  443,
       "rtsp_port":   554,
