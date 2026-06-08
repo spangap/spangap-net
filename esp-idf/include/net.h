@@ -4,8 +4,8 @@
  * ITS client: connects to server tasks on behalf of TCP/TLS clients.
  * Event-driven: modules register callbacks via netRegister().
  */
-#ifndef SECCAM_NET_H
-#define SECCAM_NET_H
+#ifndef SPANGAP_NET_H
+#define SPANGAP_NET_H
 
 #include <stddef.h>
 #include <lwip/ip_addr.h>

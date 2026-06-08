@@ -11,6 +11,8 @@
 #include "net.h"
 #include "log.h"
 #include "mdns.h"
+#include "esp_event.h"
+#include "esp_wifi.h"
 
 static void mdnsAdvertiseEntry(const char* key, const char* val) {
     /* key looks like "s.net.mdns.http"; we want the last segment ("http"). */
@@ -31,6 +33,23 @@ static void mdnsStart(const char*) {
     mdns_hostname_set(hostname);
     mdns_instance_name_set(hostname);
     storageForEach("s.net.mdns", mdnsAdvertiseEntry);
+
+    /* The mdns component enables its per-interface responder only when its own
+     * event handler *catches* the interface coming up — for the SoftAP that's
+     * WIFI_EVENT_AP_START, and that handler is only registered inside
+     * mdns_init() just above. On a factory-reset boot the net task has no
+     * stored networks, so it switches straight to the built-in AP within
+     * milliseconds of boot — long before this init runs — and AP_START has
+     * already fired and been missed. The result: mDNS is initialised but the
+     * AP responder is never enabled, so <hostname>.local is dead for anyone
+     * joined to the device's AP (the symptom on a fresh device). STA usually
+     * escapes this because the scan+associate delay leaves mdns time to
+     * register before GOT_IP. Re-post AP_START now that the handler exists so
+     * it binds the already-up AP interface. AP_START carries no event data and
+     * net's own wifi_event_handler ignores it, so the re-post is side-effect
+     * free; mdns enabling an already-enabled pcb is idempotent. */
+    if (netIsUp() && !netIsStaConnected())
+        esp_event_post(WIFI_EVENT, WIFI_EVENT_AP_START, nullptr, 0, 0);
 }
 
 static void mdnsStop(const char*) {

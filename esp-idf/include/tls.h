@@ -8,8 +8,8 @@
  * - Per-connection tls_fd_t wraps mbedtls_ssl_context + raw fd.
  * - tlsRead/tlsWrite/tlsClose mirror recv/send/close semantics.
  */
-#ifndef SECCAM_TLS_H
-#define SECCAM_TLS_H
+#ifndef SPANGAP_TLS_H
+#define SPANGAP_TLS_H
 
 #include <stddef.h>
 #include <stdbool.h>

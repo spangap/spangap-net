@@ -42,6 +42,12 @@
 
 #define MAX_STA_NETWORKS 9
 
+/* A known network that's visible in the scan but won't complete a connection
+ * gets this many connect attempts before we give up on it and fall back to the
+ * built-in AP. Without this a single failed association (which can take the
+ * full connect timeout) immediately drops us to AP. */
+#define WIFI_CONNECT_RETRIES 3
+
 static TaskHandle_t netHandle = nullptr;
 static SemaphoreHandle_t readySem = nullptr;
 
@@ -997,6 +1003,9 @@ static void netTaskFn(void* arg) {
   uint32_t scanStartMs = millis();
   uint32_t lastApRetryMs = 0;
   uint32_t lastStatusMs = 0;
+  /* Consecutive failed connects to a *seen* known network in ST_SCANNING.
+   * Every exit from scanning (connected / AP fallback) resets it to 0. */
+  int connectFails = 0;
   /* AP retry interval read from s.net.wifi.ap.retry (default 300s) */
 
   if (wantUp()) {
@@ -1131,10 +1140,26 @@ static void netTaskFn(void* arg) {
       case ST_OFF: break;
       case ST_SCANNING: {
         int idx = scanForKnown();
-        if (idx >= 0 && connectSta(idx)) {
-          state = ST_STA_CONNECTED;
-          doUp(state);
+        if (idx >= 0) {
+          /* A known network is in range. Give it WIFI_CONNECT_RETRIES attempts
+           * before falling back to AP — a flaky AP or slow DHCP shouldn't bump
+           * us off the network the user actually wants on the first miss. */
+          if (connectSta(idx)) {
+            connectFails = 0;
+            state = ST_STA_CONNECTED;
+            doUp(state);
+          } else if (++connectFails >= WIFI_CONNECT_RETRIES) {
+            info("connect to known network failed %dx, falling back to AP\n", connectFails);
+            connectFails = 0;
+            if (startAP()) { state = ST_AP; doUp(state); }
+            else { state = ST_OFF; pmLockRelease(netDeepLock); }
+          } else {
+            info("connect failed (attempt %d/%d), retrying\n", connectFails, WIFI_CONNECT_RETRIES);
+            delay(2000);
+          }
         } else if (millis() - scanStartMs >= (uint32_t)(searchTimeout * 1000)) {
+          /* No known network even visible within the search window → AP. */
+          connectFails = 0;
           if (startAP()) { state = ST_AP; doUp(state); }
           else { state = ST_OFF; pmLockRelease(netDeepLock); }
         } else {
@@ -1397,9 +1422,10 @@ static int parseArgs(const char* in, char* scratch, size_t scratchLen,
 }
 
 static void netCliCmd(const char* args) {
-    if (strcmp(args, "help") == 0) { cliPrintf("%-*s WiFi status; up/down/add/join/delete\n", CLI_HELP_COL, "net [...]"); return; }
+    if (strcmp(args, "help") == 0) { cliPrintf("%-*s WiFi status; list/up/down/add/join/delete\n", CLI_HELP_COL, "net [...]"); return; }
     if (cliWantsHelp(args)) {
         cliPrintf("%-*s WiFi control / status\n", CLI_HELP_COL, "net [up|down|down!]");
+        cliPrintf("%-*s list stored WiFi networks\n", CLI_HELP_COL, "net list");
         cliPrintf("%-*s save a WiFi network (quote spaces)\n", CLI_HELP_COL, "net add <ssid> [pass]");
         cliPrintf("%-*s force-join a known network\n", CLI_HELP_COL, "net join <ssid>");
         cliPrintf("%-*s remove + disconnect\n",     CLI_HELP_COL, "net delete <ssid>");
@@ -1408,6 +1434,26 @@ static void netCliCmd(const char* args) {
     if (strcmp(args, "up") == 0) { netUp(); return; }
     if (strcmp(args, "down!") == 0) { netDown(true); return; }
     if (strcmp(args, "down") == 0) { netDown(); return; }
+
+    if (strcmp(args, "list") == 0) {
+        int n = staNetCount();
+        if (n == 0) { cliPrintf("no stored networks\n"); return; }
+        /* Mark the one we're currently associated to, if any. */
+        char cur[33] = "";
+        if (wifiState == ST_STA_CONNECTED) {
+            wifi_ap_record_t ap_info;
+            if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK)
+                safeStrncpy(cur, (const char*)ap_info.ssid, sizeof(cur));
+        }
+        for (int i = 0; i < n; i++) {
+            char ssid[33], pass[65];
+            staNetGet(i, "ssid", ssid, sizeof(ssid));
+            staNetGet(i, "pass", pass, sizeof(pass));
+            cliPrintf("%s[%d] %s%s\n", (cur[0] && strcmp(cur, ssid) == 0) ? "* " : "  ",
+                      i, ssid, pass[0] ? "" : " (open)");
+        }
+        return;
+    }
 
     if (strncmp(args, "add ", 4) == 0 || strcmp(args, "add") == 0) {
         char scratch[160]; char* argv[2];
@@ -1424,6 +1470,15 @@ static void netCliCmd(const char* args) {
         snprintf(k, sizeof(k), "s.net.wifi.nets.%d.ssid", idx); storageSet(k, ssid);
         snprintf(k, sizeof(k), "s.net.wifi.nets.%d.pass", idx); storageSet(k, pass);
         cliPrintf("saved '%s' at index %d%s\n", ssid, idx, *pass ? "" : " (open)");
+        /* Join immediately when we're not already on a real station — i.e.
+         * sitting on the built-in AP, scanning, or off. A freshly added
+         * network should come up without a separate `net join`. An existing
+         * STA connection is left undisturbed. */
+        if (wifiState != ST_STA_CONNECTED) {
+            cliPrintf("joining '%s'…\n", ssid);
+            netDown(true);
+            netUp();
+        }
         return;
     }
 

@@ -1,5 +1,5 @@
-#ifndef SECCAM_NTP_H
-#define SECCAM_NTP_H
+#ifndef SPANGAP_NTP_H
+#define SPANGAP_NTP_H
 
 /** Register NTP net event callbacks. Call from main after netInit(). */
 void ntpInit();
