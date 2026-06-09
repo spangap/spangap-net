@@ -57,12 +57,19 @@ static void mdnsStart(const char*) {
      * AP responder is never enabled, so <hostname>.local is dead for anyone
      * joined to the device's AP (the symptom on a fresh device). STA usually
      * escapes this because the scan+associate delay leaves mdns time to
-     * register before GOT_IP. Re-post AP_START now that the handler exists so
-     * it binds the already-up AP interface. AP_START carries no event data and
-     * net's own wifi_event_handler ignores it, so the re-post is side-effect
-     * free; mdns enabling an already-enabled pcb is idempotent. */
-    if (netIsUp() && !netIsStaConnected())
-        esp_event_post(WIFI_EVENT, WIFI_EVENT_AP_START, nullptr, 0, 0);
+     * register before GOT_IP. Enable the AP responder now that the handler
+     * exists, mirroring exactly what mdns's own WIFI_EVENT_AP_START handler
+     * does — post_enable_pcb(MDNS_IF_AP, IPv4) — but driving mdns directly via
+     * its public API. We must NOT re-post the global WIFI_EVENT_AP_START:
+     * esp_netif_create_default_wifi_ap() also installs a default handler for
+     * that event which calls esp_netif_action_start() → esp_netif_start() →
+     * netif_add() on the already-started AP netif, tripping lwIP's "netif
+     * already added" assert. mdns_netif_action resolves the predefined
+     * WIFI_AP_DEF interface and enabling an already-enabled pcb is idempotent. */
+    if (netIsUp() && !netIsStaConnected()) {
+        esp_netif_t* ap = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+        if (ap) mdns_netif_action(ap, MDNS_EVENT_ENABLE_IP4);
+    }
 }
 
 static void mdnsStop(const char*) {

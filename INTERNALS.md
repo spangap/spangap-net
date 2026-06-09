@@ -84,3 +84,15 @@ configuration of spangap that runs without it.
   target task's `itsPoll`.
 - UP-event handlers must be idempotent — level-replay can fire them
   out of the net task's context.
+- **Never re-post a Wi-Fi lifecycle event (`WIFI_EVENT_STA_START` /
+  `WIFI_EVENT_AP_START` / `*_STOP`) as a notification.** They look passive,
+  but `esp_netif_create_default_wifi_{sta,ap}()` (in `wifiNetifInit`) installs
+  default handlers that treat them as *imperative* state transitions:
+  `*_START` → `esp_netif_action_start()` → `esp_netif_start()` →
+  `netif_add()`, and `*_STOP` the reverse. Re-posting `AP_START` while the AP
+  is already up therefore double-adds the lwIP netif and trips the
+  `netif_add: "netif already added"` assert (`netif.c:420`), even though net's
+  own `wifi_event_handler` ignores the event. If a *consumer* (e.g. mdns)
+  missed a real start because it registered late, drive that consumer directly
+  through its own API — `mdns_netif_action(esp_netif_get_handle_from_ifkey(
+  "WIFI_AP_DEF"), MDNS_EVENT_ENABLE_IP4)` — never via the shared `WIFI_EVENT`.
