@@ -1,10 +1,17 @@
 /**
  * mDNS — service advertisement via ESP-IDF mdns component.
  *
- * Reads `s.net.mdns.<name> = <port>` config tree: each non-zero entry is
- * advertised as `_<name>._tcp` on the given port. Drop / set to 0 to stop
- * advertising. Empty tree → no mDNS services. Hostname comes from
- * `s.net.hostname`.
+ * Reads `s.net.mdns.<name> = <port>` config tree: each entry is advertised as
+ * `_<name>._tcp`. The value is either a literal port or the name of the config
+ * key that holds the live port (e.g. "s.net.https_port") — the latter is
+ * resolved at advertise time so the advertisement follows the service's actual
+ * port. A resolved port <= 0 (or a dropped entry) advertises nothing. Empty
+ * tree → no mDNS services. Hostname comes from `s.net.hostname`.
+ *
+ * net owns only the mechanism and the `s.net.mdns_enable` master switch — the
+ * service entries belong to whoever serves them: spangap-web seeds http/https
+ * (→ s.net.{http,https}_port), sshd seeds ssh (→ s.sshd.port), each in its own
+ * init.
  */
 #include "spangap_mdns.h"
 #include "storage.h"
@@ -18,7 +25,12 @@ static void mdnsAdvertiseEntry(const char* key, const char* val) {
     /* key looks like "s.net.mdns.http"; we want the last segment ("http"). */
     const char* dot = strrchr(key, '.');
     if (!dot || !dot[1]) return;
-    int port = atoi(val);
+    /* val is either a literal port ("443") or the name of the config key that
+     * holds the live port ("s.net.https_port"). Resolving the reference at
+     * advertise time (we re-run on every NET_EV_UP) keeps the advertisement in
+     * step with the service's actual configured port instead of a stale copy. */
+    int port = (val[0] >= '0' && val[0] <= '9') ? atoi(val)
+                                                : storageGetInt(val, 0);
     if (port <= 0) return;
     char service[16];
     snprintf(service, sizeof(service), "_%s", dot + 1);
@@ -26,6 +38,7 @@ static void mdnsAdvertiseEntry(const char* key, const char* val) {
 }
 
 static void mdnsStart(const char*) {
+    if (!storageGetInt("s.net.mdns_enable", 1)) return;  /* master switch */
     char hostname[32];
     storageGetStr("s.net.hostname", hostname, sizeof(hostname), "");
     if (!hostname[0]) return;       /* no hostname → no mDNS */
@@ -56,14 +69,8 @@ static void mdnsStop(const char*) {
     mdns_free();
 }
 
-#define MDNS_VERSION 1
-
 void mdnsInit() {
-    if (storageGetInt("s.net.mdns_version", 0) < MDNS_VERSION) {
-        storageDefault("s.net.mdns.http", 80);
-        storageDefault("s.net.mdns.https", 443);
-        storageSet("s.net.mdns_version", MDNS_VERSION);
-    }
+    storageDefault("s.net.mdns_enable", 1);   /* master switch, default on */
 
     netRegister(NET_EV_UP,   mdnsStart);
     netRegister(NET_EV_DOWN, mdnsStop);
