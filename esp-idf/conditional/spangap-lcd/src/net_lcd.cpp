@@ -29,9 +29,23 @@ static void wifiSettingsPane(void* arg) {
   lcdSettingText   (p, "Netmask",  "s.net.wifi.ap.mask");
 }
 
-/* Register the on-device Net → Wifi settings pane — a when:-gated init: hook
+/* On-device Settings → System pane. Mirrors the browser SystemPanel: device
+ * hostname + time/date (NTP). Top-level group (placement 1 sorts it above
+ * Internet / Mesh Network, matching the web menu order). The timezone is a
+ * free-text IANA name (e.g. "Europe/Berlin"); the browser offers the picker. */
+static void systemSettingsPane(void* arg) {
+  lv_obj_t* p = static_cast<lv_obj_t*>(arg);
+  lcdSettingSection(p, "This System");
+  lcdSettingText   (p, "Hostname", "s.net.hostname");
+  lcdSettingSection(p, "Time & Date");
+  lcdSettingText   (p, "Timezone",   "s.ntp.tz");
+  lcdSettingText   (p, "NTP Server", "s.ntp.server");
+}
+
+/* Register the on-device Net settings panes — a when:-gated init: hook
  * (spangap/spangap-lcd). Plain C++ linkage to match the generated dispatcher's
  * forward decl. */
 void netLcdRegister(void) {
-  lcdRegisterSettings("Net/Wifi", "Wifi", wifiSettingsPane);
+  lcdRegisterSettings("System", "System", systemSettingsPane, 1);
+  lcdRegisterSettings("Internet/WiFi", "WiFi", wifiSettingsPane, 1);
 }

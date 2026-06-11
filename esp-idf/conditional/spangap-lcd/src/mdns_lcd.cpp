@@ -8,11 +8,12 @@
  */
 #include "lcd.h"
 
-/* On-device Settings → Net → mDNS pane. The browser exposes a single toggle; on
- * device we surface the actual advertised ports (0 = don't advertise). */
+/* On-device Settings → Internet → mDNS pane. Mirrors the browser MdnsPanel:
+ * an enable toggle plus the advertised ports (0 = don't advertise). */
 static void mdnsSettingsPane(void* arg) {
     lv_obj_t* p = static_cast<lv_obj_t*>(arg);
     lcdSettingSection(p, "mDNS");
+    lcdSettingSwitch (p, "Enable",     "s.net.mdns_enable");
     lcdSettingText   (p, "HTTP port",  "s.net.mdns.http");
     lcdSettingText   (p, "HTTPS port", "s.net.mdns.https");
 }
@@ -21,5 +22,5 @@ static void mdnsSettingsPane(void* arg) {
  * (spangap/spangap-lcd). Plain C++ linkage to match the generated dispatcher's
  * forward decl. */
 void mdnsLcdRegister(void) {
-    lcdRegisterSettings("Net/mDNS", "mDNS", mdnsSettingsPane);
+    lcdRegisterSettings("Internet/mDNS", "mDNS", mdnsSettingsPane);
 }

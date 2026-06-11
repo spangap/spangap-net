@@ -1,14 +1,17 @@
 # spangap-net — IP networking + TLS + NTP + mDNS.
 #
-# Split out of spangap-core in Phase 2 of the straddles plan. Firmware-only,
-# no browser half, not a UI activator. Pulled in by any straddle that needs
-# WiFi/TCP/UDP — RNS-over-TCP, AutoInterface UDP-multicast, HTTPS server,
-# OTA, ACME, etc. A LoRa- or ESPNOW-only node skips this entirely.
+# Split out of spangap-core in Phase 2 of the straddles plan. Pulled in by any
+# straddle that needs WiFi/TCP/UDP — RNS-over-TCP, AutoInterface UDP-multicast,
+# HTTPS server, OTA, ACME, etc. A LoRa- or ESPNOW-only node skips this entirely.
+# Owns its own frontends: the on-device WiFi/mDNS LCD panes (netLcdRegister /
+# mdnsLcdRegister, when: spangap-lcd) and the browser WiFi/mDNS panels
+# (browser_register: registerNet, when spangap-web stages the SPA shell).
 schema_version: 1
 name: spangap/spangap-net
 prefix: net
 version: 0.1.0
 firmware: esp-idf
+browser: browser
 platforms: [idf]
 # spangap-core is implicit (the empty-prefix platform foundation) — not listed.
 # Remote-access services ride on the IP stack: anything that pulls in net gets
@@ -40,3 +43,11 @@ init:
     when: spangap/spangap-lcd
   - call: mdnsLcdRegister
     when: spangap/spangap-lcd
+
+# Browser-side UI registration (parallel to init:) — auto-wired into the
+# buildable SPA via straddles.gen.ts when spangap-web stages the shell. Replaces
+# the hand-maintained registerNetwork() that used to live in spangap-web's own
+# boot/modules.ts (the shell no longer reaches into s.net.* keys).
+browser_register:
+  - call: registerNet
+    module: modules/net
