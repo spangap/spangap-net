@@ -624,6 +624,10 @@ static volatile wifi_state_t wifiState = ST_OFF;
 static void setUpstream(bool up) {
   if (upstreamUp == up) return;
   upstreamUp = up;
+  /* Ephemeral readiness flag the rns boot barrier waits on (only when WiFi is
+   * configured — see net.want). Decoupled by storage key so rns has no net
+   * dependency and net-less builds simply never set it. */
+  storageSet("net.up", up ? 1 : 0);
   fireEvent(up ? NET_EV_UPSTREAM_UP : NET_EV_UPSTREAM_DOWN);
 }
 
@@ -951,6 +955,12 @@ static void netTaskFn(void* arg) {
 
   /* Run /state/net_up on every upstream-up — net policy, not the consumer's. */
   netRegister(NET_EV_UPSTREAM_UP, netOnUpstreamUp);
+
+  /* Tell the rns boot barrier whether to wait for the network: 1 if any STA
+   * network is configured (so net.up is expected), else 0 so a WiFi-less node
+   * doesn't stall the barrier waiting for an IP that will never come. Ephemeral
+   * key keeps rns decoupled from net (and net-less builds never set it). */
+  storageSet("net.want", staNetCount() > 0 ? 1 : 0);
 
   /* Net's own config: re-open endpoints when ports/host change. */
   storageSubscribeChanges("s.net.", ON_CHANGE {
