@@ -1004,6 +1004,16 @@ static void netTaskFn(void* arg) {
     }
   });
 
+  /* Master WiFi switch. s.net.wifi.enable was a defined config key (default 1)
+   * that nothing consumed — setting it 0 did nothing, the radio kept scanning.
+   * Bring net down/up to match; cold boot also seeds rtcWantUp from it (netInit).
+   * netDown/netUp here post a command to our own inbox, picked up next loop. */
+  storageSubscribeChanges("s.net.wifi.enable", ON_CHANGE {
+    if (strcmp(key, "s.net.wifi.enable") != 0) return;
+    if (atoi(val) == 0) { info("wifi.enable=0 → bringing net down\n"); netDown(true); }
+    else                { info("wifi.enable=1 → bringing net up\n");   netUp(); }
+  });
+
   wifiNetifInit();
 
   xSemaphoreGive(readySem);  /* unblock netInit — task is running */
@@ -1668,8 +1678,12 @@ void netInit() {
     netClients[i].tlsConn = nullptr;
     netClients[i].itsHandle = -1;
   }
-  /* Cold boot: default to up. Deep sleep wake: preserve previous state. */
-  if (!rtcRamValid()) rtcWantUp = true;
+  /* Cold boot: honor the persisted master switch s.net.wifi.enable (default 1).
+   * Deep sleep wake: preserve previous runtime state (rtcWantUp survives in RTC
+   * RAM, and the wifi.enable change handler below keeps it in sync while awake).
+   * Previously this hardcoded `true`, so s.net.wifi.enable was a dead key — set
+   * to 0 and the radio kept scanning. */
+  if (!rtcRamValid()) rtcWantUp = storageGetInt("s.net.wifi.enable", 1) != 0;
 
   readySem = xSemaphoreCreateBinary();
   wifiConnectedSem = xSemaphoreCreateBinary();
