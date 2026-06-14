@@ -6,6 +6,7 @@
  * Events: modules register callbacks via netRegister() for UP/DOWN/CFG/POLL.
  */
 #include "net.h"
+#include "mem.h"
 #include "storage.h"
 #include "compat.h"
 #include "pm.h"
@@ -74,7 +75,12 @@ static volatile int cmdConnectIdx = -1;  /* target network index for NET_CMD_CON
 /* RTC state: survives deep sleep. On cold boot, boot file runs "net up". */
 RTC_DATA_ATTR static bool rtcWantUp = false;
 
-static bool wantUp() { return rtcWantUp; }
+/* The master off switch s.net.wifi.enable gates EVERY "should we be up?" check —
+ * boot bring-up, scan, AP-retry. rtcWantUp is only a runtime cache (it can drift:
+ * preserved across resets, set by net up/down), so gating on it alone let a stale
+ * rtcWantUp=1 bring the radio up against an explicit enable=0. enable is the
+ * persistent truth, so it wins here unconditionally. */
+static bool wantUp() { return rtcWantUp && storageGetInt("s.net.wifi.enable", 1) != 0; }
 
 static pm_lock_handle_t netDeepLock = nullptr;
 
@@ -593,7 +599,7 @@ static int scanForKnown() {
   esp_wifi_scan_get_ap_num(&ap_count);
   if (ap_count == 0) { info("scan found 0 networks\n"); return -1; }
   info("scan found %d networks\n", ap_count);
-  wifi_ap_record_t* ap_list = (wifi_ap_record_t*)malloc(ap_count * sizeof(wifi_ap_record_t));
+  wifi_ap_record_t* ap_list = (wifi_ap_record_t*)gp_alloc(ap_count * sizeof(wifi_ap_record_t));
   if (!ap_list) return -1;
   esp_wifi_scan_get_ap_records(&ap_count, ap_list);
   for (int i = 0; i < ap_count; i++)
@@ -643,7 +649,7 @@ static void publishScanResults() {
     storageSetTree("wifi.scanned", cJSON_CreateArray());
     return;
   }
-  wifi_ap_record_t* ap_list = (wifi_ap_record_t*)malloc(ap_count * sizeof(wifi_ap_record_t));
+  wifi_ap_record_t* ap_list = (wifi_ap_record_t*)gp_alloc(ap_count * sizeof(wifi_ap_record_t));
   if (!ap_list) return;
   esp_wifi_scan_get_ap_records(&ap_count, ap_list);
 
@@ -1678,12 +1684,16 @@ void netInit() {
     netClients[i].tlsConn = nullptr;
     netClients[i].itsHandle = -1;
   }
-  /* Cold boot: honor the persisted master switch s.net.wifi.enable (default 1).
-   * Deep sleep wake: preserve previous runtime state (rtcWantUp survives in RTC
-   * RAM, and the wifi.enable change handler below keeps it in sync while awake).
-   * Previously this hardcoded `true`, so s.net.wifi.enable was a dead key — set
-   * to 0 and the radio kept scanning. */
-  if (!rtcRamValid()) rtcWantUp = storageGetInt("s.net.wifi.enable", 1) != 0;
+  /* Master switch s.net.wifi.enable (default 1). Cold boot: seed rtcWantUp from
+   * it. Warm boot / deep-sleep wake: preserve the runtime state (rtcWantUp lives
+   * in RTC RAM) EXCEPT enable=0 always forces down — an explicit "off" must
+   * survive a reset, and the change handler may not have run this boot (e.g. the
+   * value was set in a config/boot script before net subscribed). Previously
+   * this only seeded on cold boot, so a warm boot kept the preserved rtcWantUp=1
+   * and scanned + brought up AP despite enable=0. */
+  bool wifiEnabled = storageGetInt("s.net.wifi.enable", 1) != 0;
+  if (!rtcRamValid())    rtcWantUp = wifiEnabled;
+  else if (!wifiEnabled) rtcWantUp = false;
 
   readySem = xSemaphoreCreateBinary();
   wifiConnectedSem = xSemaphoreCreateBinary();
@@ -1692,6 +1702,14 @@ void netInit() {
 }
 
 void netUp() {
+  /* Master switch chokepoint: enable=0 means the radio stays off, period — every
+   * caller (the wifi.enable change handler, `net up`, add-network helpers) is a
+   * no-op while disabled. This is what stops a spurious/duplicate bring-up (the
+   * cmdUp path doesn't consult wantUp()) from overriding an explicit disable. */
+  if (storageGetInt("s.net.wifi.enable", 1) == 0) {
+    info("netUp() ignored — wifi.enable=0\n");
+    return;
+  }
   rtcWantUp = true;
   if (!netHandle) return;  /* net task will pick up rtcWantUp on start */
   uint8_t cmd = NET_CMD_UP;

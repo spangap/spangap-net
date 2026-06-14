@@ -5,6 +5,7 @@
  * Browser can push epoch seconds via sys.time.set when NTP is unavailable.
  */
 #include "ntp.h"
+#include "mem.h"
 #include "storage.h"
 #include "fs.h"
 #include "net.h"
@@ -99,7 +100,7 @@ static bool zoneLookup(const char* iana, char* out, size_t outLen) {
   fs_seek(fd, 0, SEEK_SET);
   if (sz <= 0 || sz > 256 * 1024) { fs_close(fd); return false; }
   char* buf = (char*)heap_caps_malloc(sz + 1, MALLOC_CAP_SPIRAM);
-  if (!buf) buf = (char*)malloc(sz + 1);
+  if (!buf) buf = (char*)gp_alloc(sz + 1);
   if (!buf) { fs_close(fd); return false; }
   size_t rd = fs_read(buf, 1, sz, fd);
   fs_close(fd);
@@ -157,7 +158,21 @@ static void ntpOnUp(const char*)   { s_up = true;  ntpEngineApply(); }
 static void ntpOnDown(const char*) { s_up = false; ntpEngineApply(); }
 /* Cheap reconcile (two bool compares) on each net poll, so an ntpInhibit()
  * flip from another task takes effect without its own event. */
-static void ntpOnPoll(const char*) { ntpEngineApply(); }
+static void ntpOnPoll(const char*) {
+  /* Register the sys.time.ext subscription HERE — on the net task, which lives
+   * and polls — not in ntpInit(), which runs on the auto-init dispatcher
+   * (main_task) and self-deletes when app_main returns, orphaning the
+   * subscription (callback never fires; storage logs a "notify drop" into the
+   * freed TCB). Once, on first poll; apply the current value too, in case a local
+   * clock authority claimed it before net came up. */
+  static bool subDone = false;
+  if (!subDone) {
+    subDone = true;
+    storageSubscribeChanges("sys.time.ext", ON_CHANGE { ntpInhibit(atoi(val) != 0); });
+    ntpInhibit(storageGetInt("sys.time.ext", 0) != 0);
+  }
+  ntpEngineApply();
+}
 
 /* ---- NET_EV_CFG_CHANGED: timezone + time set ---- */
 
@@ -269,13 +284,12 @@ void ntpInit() {
   netRegister(NET_EV_CFG_CHANGED,   ntpOnCfg);
 
   /* A local time authority (e.g. a GPS receiver) parks SNTP by writing
-   * sys.time.ext=1 on the storage state bus — and releases it with 0. Driving
-   * it through storage instead of a direct ntpInhibit() call means the time
-   * source needs no compile-time dependency on net: a net-less image just has
-   * no subscriber, and the source owns the clock outright. */
-  storageSubscribeChanges("sys.time.ext", ON_CHANGE {
-    ntpInhibit(atoi(val) != 0);
-  });
+   * sys.time.ext=1 on the storage state bus — and releases it with 0. Driving it
+   * through storage instead of a direct ntpInhibit() call means the time source
+   * needs no compile-time dependency on net: a net-less image just has no
+   * subscriber, and the source owns the clock outright. The subscription is
+   * registered lazily in ntpOnPoll (on the net task) — NOT here — because ntpInit
+   * runs on main_task, which self-deletes and would orphan it. */
 
   cliRegisterCmd("date wait", cmdDateWait);
   cliRegisterCmd("date", cmdDate);
