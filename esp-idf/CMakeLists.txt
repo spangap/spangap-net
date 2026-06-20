@@ -19,6 +19,7 @@ idf_component_register(
         nvs_flash
         lwip
         mbedtls
+        esp_http_client
         espressif__mdns
         esp_timer
         json

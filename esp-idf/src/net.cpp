@@ -1678,6 +1678,8 @@ void netInit() {
   pmLockCreate(PM_NO_DEEP_SLEEP, "net", &netDeepLock);
   cliRegisterCmd("net", netCliCmd);
   cliRegisterCmd("ping", pingCliCmd);
+  void wgetRegister();   /* wget.cpp — download CLI verb */
+  wgetRegister();
 
   for (int i = 0; i < NET_MAX_CLIENTS; i++) {
     netClients[i].fd = -1;
