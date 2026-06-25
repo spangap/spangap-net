@@ -6,6 +6,7 @@
 #include "storage.h"
 #include "log.h"
 #include "cli.h"
+#include "mem.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -39,9 +40,9 @@ struct tls_conn {
 
 /* ---- Shared server state ---- */
 
-static mbedtls_entropy_context entropy;
+PSRAM_BSS static mbedtls_entropy_context entropy;
 static mbedtls_ctr_drbg_context ctr_drbg;
-static mbedtls_x509_crt srvcert;
+PSRAM_BSS static mbedtls_x509_crt srvcert;
 static mbedtls_pk_context pkey;
 static mbedtls_ssl_config conf;
 static bool ready = false;

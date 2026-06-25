@@ -376,7 +376,16 @@ static void netPollOnce() {
         if (canRecv) {
             int n = c.tlsConn ? tlsRead(c.tlsConn, netProxyBuf, 4096)
                               : recv(c.fd, netProxyBuf, 4096, MSG_DONTWAIT);
-            if (c.tlsConn ? (n < 0) : (n == 0)) { netClientClose(c); continue; }
+            /* Close on dead peer. TLS: tlsRead maps real error/EOF to <0 and
+             * no-data (WANT_READ) to 0. Raw recv is the opposite — 0 is EOF,
+             * <0 is either no-data (EAGAIN) or a real error (ECONNRESET, or
+             * ETIMEDOUT from the keepalive set on accept). Treat any non-EAGAIN
+             * negative as dead; otherwise an errored fd stays select-readable
+             * forever and the net task spins at ~100% CPU with no log output. */
+            bool dead = c.tlsConn ? (n < 0)
+                                  : (n == 0 ||
+                                     (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK));
+            if (dead) { netClientClose(c); continue; }
             if (n > 0) { itsSend(c.itsHandle, netProxyBuf, n, 0); netActivity(); trafficIn += n; }
         }
 
