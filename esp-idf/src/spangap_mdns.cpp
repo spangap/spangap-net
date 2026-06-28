@@ -77,8 +77,9 @@ static void mdnsStop(const char*) {
 }
 
 void mdnsInit() {
-    storageDefault("s.net.mdns_enable", 1);   /* master switch, default on */
-
+    /* s.net.mdns_enable default (1, master switch on) is seeded by the
+     * generated spangapSettingsGenDefaults() from this straddle's `settings:`
+     * block — runs before any straddle init, so it's present here. */
     netRegister(NET_EV_UP,   mdnsStart);
     netRegister(NET_EV_DOWN, mdnsStop);
 }

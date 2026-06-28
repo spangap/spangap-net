@@ -41,8 +41,32 @@ init:
   - call: mdnsInit
   - call: netLcdRegister
     when: spangap/spangap-lcd
-  - call: mdnsLcdRegister
-    when: spangap/spangap-lcd
+
+# Declarative settings panes (lowered to LCD pane + web panel + storage defaults
+# by the build). The mDNS pane is fully static, so it lives here instead of in a
+# hand-written mdns_lcd.cpp / MdnsPanel.vue / storageDefault() trio. WiFi stays
+# hand-written (scan dialog, known-networks array — a custom flow).
+settings:
+  - menu:
+      - { id: network, label: "Internet", placement: 2 }
+      - { id: mdns, label: "mDNS" }
+    rows:
+      - section: "mDNS"
+      - switch: { label: "Enable", key: "s.net.mdns_enable", default: 1 }
+      - text:   { label: "HTTP port", key: "s.net.mdns.http" }
+      - text:   { label: "HTTPS port", key: "s.net.mdns.https" }
+  # System pane (top-level). web: false — SystemPanel.vue keeps the web leaf (it
+  # has the searchable timezone picker). Rows are defaultless: hostname/tz/server
+  # defaults live in the s.net / s.ntp storageDefaultTree (net.cpp / ntp.cpp).
+  - menu:
+      - { id: system, label: "System", placement: 1 }
+    web: false
+    rows:
+      - section: "This System"
+      - text: { label: "Hostname", key: "s.net.hostname" }
+      - section: "Time & Date"
+      - text: { label: "Timezone", key: "s.ntp.tz" }
+      - text: { label: "NTP Server", key: "s.ntp.server" }
 
 # Browser-side UI registration (parallel to init:) — auto-wired into the
 # buildable SPA via straddles.gen.ts when spangap-web stages the shell. Replaces

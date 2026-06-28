@@ -69,8 +69,15 @@ static uint32_t trafficOut = 0;
 #define WIFI_IDLE_TIMEOUT_MS 30000
 
 /* ITS aux command interface */
-enum { NET_CMD_UP = 1, NET_CMD_DOWN, NET_CMD_FORCE_DOWN, NET_CMD_CONNECT, NET_CMD_DISCONNECT };
+enum { NET_CMD_UP = 1, NET_CMD_DOWN, NET_CMD_FORCE_DOWN, NET_CMD_CONNECT, NET_CMD_DISCONNECT,
+       NET_CMD_WIFI_ADD, NET_CMD_WIFI_DEL };
 static volatile int cmdConnectIdx = -1;  /* target network index for NET_CMD_CONNECT */
+/* On-device WiFi add/delete sentinels (LCD WiFi pane). Captured once by the
+ * wifi.cmd.* subscribers, applied in the net task loop (see netTaskFn). */
+static volatile bool cmdWifiAdd = false;
+static char          cmdWifiAddBuf[96];
+static volatile bool cmdWifiDel = false;
+static volatile int  cmdWifiDelIdx = -1;
 
 /* RTC state: survives deep sleep. On cold boot, boot file runs "net up". */
 RTC_DATA_ATTR static bool rtcWantUp = false;
@@ -589,6 +596,32 @@ static void staNetGet(int idx, const char* field, char* out, size_t len, const c
   storageGetStr(key, out, len, def);
 }
 
+static int staNetFindBySsid(const char* ssid);   /* defined below; used by the task loop */
+
+/** Remove known network [idx], shifting later entries down and dropping the
+ *  tail — the array-correct delete (a bare delete of an index would leave a
+ *  hole). Shared by the `net delete` CLI verb and the on-device `wifi.cmd.del`
+ *  sentinel (the LCD WiFi pane writes that; the browser rewrites the array). */
+static void staNetDeleteIdx(int idx) {
+  int total = staNetCount();
+  if (idx < 0 || idx >= total) return;
+  storageBegin();
+  for (int i = idx; i < total - 1; i++) {
+    char src[64], dst[64];
+    for (const char* f : { "ssid", "pass", "ip", "gw", "mask", "dns", "mac" }) {
+      snprintf(src, sizeof(src), "s.net.wifi.nets.%d.%s", i + 1, f);
+      snprintf(dst, sizeof(dst), "s.net.wifi.nets.%d.%s", i, f);
+      std::string v = storageGetStr(src, "");
+      if (v.empty()) storageUnset(dst);
+      else           storageSet(dst, v.c_str());
+    }
+  }
+  char tail[64];
+  snprintf(tail, sizeof(tail), "s.net.wifi.nets.%d", total - 1);
+  storageDeleteTree(tail);
+  storageEnd();
+}
+
 static void logNetworks() {
   int n = staNetCount();
   info("known networks: %d\n", n);
@@ -945,6 +978,18 @@ static void netCmdHandler(TaskHandle_t, const void* data, size_t len) {
     case NET_CMD_CONNECT:
       if (len >= 2) cmdConnectIdx = ((const uint8_t*)data)[1];
       break;
+    case NET_CMD_WIFI_ADD: {
+      /* payload after the cmd byte is "<ssid>\t<pass>" (not NUL-terminated). */
+      size_t n = (len > 1) ? len - 1 : 0;
+      if (n >= sizeof(cmdWifiAddBuf)) n = sizeof(cmdWifiAddBuf) - 1;
+      memcpy(cmdWifiAddBuf, (const uint8_t*)data + 1, n);
+      cmdWifiAddBuf[n] = '\0';
+      cmdWifiAdd = true;
+      break;
+    }
+    case NET_CMD_WIFI_DEL:
+      if (len >= 2) { cmdWifiDelIdx = ((const uint8_t*)data)[1]; cmdWifiDel = true; }
+      break;
   }
 }
 
@@ -1017,6 +1062,22 @@ static void netTaskFn(void* arg) {
       uint8_t cmd = NET_CMD_DISCONNECT;
       itsSendAuxByTaskHandle(netHandle, NET_CMD_PORT, &cmd, 1, pdMS_TO_TICKS(100));
     }
+  });
+  /* On-device WiFi add/delete (LCD WiFi pane). Forward to the net task over ITS
+   * (like connect) so the array writes happen there, not on the storage actor. */
+  storageSubscribeChanges("wifi.cmd.add", ON_CHANGE {
+    if (strcmp(key, "wifi.cmd.add") != 0 || !val || !*val) return;
+    uint8_t buf[1 + sizeof(cmdWifiAddBuf)];
+    buf[0] = NET_CMD_WIFI_ADD;
+    size_t n = strlen(val);
+    if (n > sizeof(cmdWifiAddBuf) - 1) n = sizeof(cmdWifiAddBuf) - 1;
+    memcpy(buf + 1, val, n);
+    itsSendAuxByTaskHandle(netHandle, NET_CMD_PORT, buf, 1 + n, pdMS_TO_TICKS(100));
+  });
+  storageSubscribeChanges("wifi.cmd.del", ON_CHANGE {
+    if (strcmp(key, "wifi.cmd.del") != 0 || !val || !*val) return;
+    uint8_t buf[2] = { NET_CMD_WIFI_DEL, (uint8_t)atoi(val) };
+    itsSendAuxByTaskHandle(netHandle, NET_CMD_PORT, buf, 2, pdMS_TO_TICKS(100));
   });
 
   /* Master WiFi switch. s.net.wifi.enable was a defined config key (default 1)
@@ -1141,6 +1202,38 @@ static void netTaskFn(void* arg) {
         publishWifiStatus();
         continue;
       }
+    }
+
+    /* On-device WiFi add (the LCD WiFi pane writes wifi.cmd.add="<ssid>\t<pass>";
+     * the browser rewrites s.net.wifi.nets[] directly). Captured once by the
+     * subscriber, applied here in the net task so the array writes run in a safe
+     * context. The join is emitted as a SEPARATE wifi.connect op: storage ops
+     * commit in emit order, so ssid/pass are committed before the connect
+     * handler reads them — the same ordered add-then-connect the browser uses. */
+    if (cmdWifiAdd) {
+      cmdWifiAdd = false;
+      storageDeleteTree("wifi.cmd.add");
+      std::string add = cmdWifiAddBuf;
+      size_t tab = add.find('\t');
+      std::string ssid = add.substr(0, tab == std::string::npos ? add.size() : tab);
+      std::string pass = tab == std::string::npos ? "" : add.substr(tab + 1);
+      if (!ssid.empty()) {
+        int idx = staNetFindBySsid(ssid.c_str());
+        if (idx < 0) idx = staNetCount();
+        char k[64], v[8];
+        snprintf(k, sizeof(k), "s.net.wifi.nets.%d.ssid", idx); storageSet(k, ssid.c_str());
+        snprintf(k, sizeof(k), "s.net.wifi.nets.%d.pass", idx); storageSet(k, pass.c_str());
+        snprintf(v, sizeof(v), "%d", idx); storageSet("wifi.connect", v);
+        info("on-device add '%s' at %d — joining\n", ssid.c_str(), idx);
+      }
+      continue;
+    }
+    /* On-device WiFi delete: wifi.cmd.del="<index>" → array-correct remove. */
+    if (cmdWifiDel) {
+      cmdWifiDel = false;
+      storageDeleteTree("wifi.cmd.del");
+      staNetDeleteIdx(cmdWifiDelIdx);
+      continue;
     }
 
     /* Graceful shutdown: want_up=0 + connected → wait for idle */
@@ -1552,22 +1645,7 @@ static void netCliCmd(const char* args) {
             if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK &&
                 strcmp((const char*)ap_info.ssid, ssid) == 0) wasJoined = true;
         }
-        /* Shift entries [idx+1, total-1] down, then drop the tail subtree. */
-        storageBegin();
-        for (int i = idx; i < total - 1; i++) {
-            char src[64], dst[64];
-            for (const char* f : { "ssid", "pass", "ip", "gw", "mask", "dns", "mac" }) {
-                snprintf(src, sizeof(src), "s.net.wifi.nets.%d.%s", i + 1, f);
-                snprintf(dst, sizeof(dst), "s.net.wifi.nets.%d.%s", i, f);
-                std::string v = storageGetStr(src, "");
-                if (v.empty()) storageUnset(dst);
-                else           storageSet(dst, v.c_str());
-            }
-        }
-        char tail[64];
-        snprintf(tail, sizeof(tail), "s.net.wifi.nets.%d", total - 1);
-        storageDeleteTree(tail);
-        storageEnd();
+        staNetDeleteIdx(idx);   /* array-correct shift+drop (shared with wifi.cmd.del) */
         cliPrintf("removed '%s' (%d remain)\n", ssid, total - 1);
         if (wasJoined) {
             cliPrintf("disconnecting (was the current STA)…\n");
