@@ -1,10 +1,10 @@
 # spangap-net — IP networking + TLS + NTP + mDNS.
 #
-# Split out of spangap-core in Phase 2 of the straddles plan. Pulled in by any
-# straddle that needs WiFi/TCP/UDP — RNS-over-TCP, AutoInterface UDP-multicast,
-# HTTPS server, OTA, ACME, etc. A LoRa- or ESPNOW-only node skips this entirely.
-# Owns its own frontends: the on-device WiFi/mDNS LCD panes (netLcdRegister /
-# mdnsLcdRegister, when: spangap-lcd) and the browser WiFi/mDNS panels
+# Pulled in by any straddle that needs WiFi/TCP/UDP — RNS-over-TCP,
+# AutoInterface UDP-multicast, HTTPS server, OTA, ACME, etc. A LoRa- or
+# ESPNOW-only node skips this entirely. Owns its own frontends: the on-device
+# WiFi LCD pane (netLcdRegister, when: spangap-lcd) plus the declarative mDNS
+# pane (settings: block below), and the browser WiFi/mDNS panels
 # (browser_register: registerNet, when spangap-web stages the SPA shell).
 schema_version: 1
 name: spangap/spangap-net
@@ -18,17 +18,17 @@ platforms: [idf]
 # ACME / UPnP / WireGuard / DuckDNS / sshd staged by default (each hard-requires
 # net anyway). They carry their own when:-gated init hooks plus a browser_register
 # hook, so a build that drops one with `spangap build --without spangap/<name>`
-# compiles AND un-bundles its UI cleanly. (The on-device Net Settings panes still
-# register via the when: spangap/spangap-lcd netLcdRegister / mdnsLcdRegister
-# hooks below — they ride on whoever staged lcd, no longer on a net-side install.)
+# compiles AND un-bundles its UI cleanly. (The on-device WiFi Settings pane
+# registers via the when: spangap/spangap-lcd netLcdRegister hook below, and the
+# mDNS pane is declarative — both ride on whoever staged lcd, not on a net install.)
 additional_installs:
   - spangap/acme
   - spangap/upnp
   - spangap/wg
   - spangap/duckdns
   - spangap/sshd
-# Auto-init: the net foundation the buildable used to bring up by hand in
-# app_main is now folded into the generated spangapInitStraddles() dispatcher.
+# Auto-init: the net foundation is brought up by the generated
+# spangapInitStraddles() dispatcher.
 # net is in the dispatcher's platform band (right after core, see spangap-inside
 # PLATFORM_ORDER), so the IP stack is up before every service/app straddle —
 # they need not order themselves against it. These four fire in listed order:

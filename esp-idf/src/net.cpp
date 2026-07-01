@@ -282,8 +282,13 @@ static void netAcceptOne(int ei, int fd, tls_conn_t* conn, struct sockaddr_in* p
     if (ci < 0) { if (conn) tlsClose(conn); else close(fd); return; }
     net_connect_t cd = { 0, (uint8_t)(conn ? 1 : 0), {} };
     ip_addr_set_ip4_u32_val(cd.clientAddr, peer->sin_addr.s_addr);
+    /* 1 s, not 100 ms: the backend (e.g. [web]) shares core 1 with storage and
+     * lxmf, so an inbound-message burst can keep it off-CPU for the better part
+     * of a second. A 100 ms ack window turned that transient into a dropped
+     * browser connection; 1 s rides it out while still failing fast on a truly
+     * dead backend. */
     int h = itsConnectByTaskHandle(ep.task, ep.itsPort, &cd, sizeof(cd),
-                                    pdMS_TO_TICKS(100), -1, nullptr, netItsDisconnect);
+                                    pdMS_TO_TICKS(1000), -1, nullptr, netItsDisconnect);
     if (h < 0) { if (conn) tlsClose(conn); else close(fd); return; }
     netClients[ci] = { fd, conn, h, ei, ep.task };
 }
