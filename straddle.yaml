@@ -9,7 +9,7 @@
 schema_version: 1
 name: spangap/spangap-net
 prefix: net
-version: 0.1.0
+version: 0.0.0
 firmware: esp-idf
 browser: browser
 platforms: [idf]
