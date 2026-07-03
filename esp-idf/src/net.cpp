@@ -639,6 +639,7 @@ static void logNetworks() {
 
 static int scanForKnown() {
   info("scanning...\n");
+  esp_wifi_scan_stop();   /* drop any wedged/in-flight scan left by a prior attempt */
   wifi_scan_config_t scan_config = {};
   esp_err_t e = esp_wifi_scan_start(&scan_config, true);
   if (e != ESP_OK) { info("scan start failed: %s\n", esp_err_to_name(e)); return -1; }
@@ -1307,6 +1308,15 @@ static void netTaskFn(void* arg) {
           fireEvent(NET_EV_DOWN);
           epCloseAll();
           esp_wifi_disconnect();
+          /* Clear the residual STA config. When the AP we were on vanishes
+           * (e.g. A20 goes out of range) its SSID stays loaded in the driver,
+           * which keeps churning on it and wedges the rescan below — so
+           * scanForKnown() never matches an alternate visible network and we
+           * time out into AP mode until a reboot. Nulling the target restores a
+           * clean scan; WIFI_STORAGE_RAM keeps it RAM-only, so connectSta()
+           * rewrites it on the next real connect. */
+          { wifi_config_t clear = {};
+            esp_wifi_set_config(WIFI_IF_STA, &clear); }
           /* Keep PM lock — still want_up, will reconnect */
           state = ST_SCANNING;
           scanStartMs = millis();
