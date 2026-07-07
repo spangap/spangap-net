@@ -27,9 +27,8 @@ additional_installs:
   - spangap/wg
   - spangap/duckdns
   - spangap/sshd
-# Auto-init: the net foundation is brought up by the generated
-# spangapInitStraddles() dispatcher.
-# net is in the dispatcher's platform band (right after core, see spangap-inside
+# Auto-init: the net foundation is brought up in the generated serviceRunInit()
+# walk. net registers in the platform band (right after core, see spangap-inside
 # PLATFORM_ORDER), so the IP stack is up before every service/app straddle —
 # they need not order themselves against it. These four fire in listed order:
 # TLS, then the netif/WiFi, then NTP (which ends by applying the persisted
