@@ -50,7 +50,7 @@
 
       <div class="row q-gutter-x-sm q-mt-xs">
         <q-btn dense no-caps label="+" class="net-btn" @click="showScanDialog = true" />
-        <q-btn dense no-caps label="&minus;" class="net-btn" :disable="selectedIdx < 0 || selectedIdx === connectedIdx" @click="removeNetwork" />
+        <q-btn dense no-caps class="net-btn" :disable="selectedIdx < 0 || selectedIdx === connectedIdx" @click="removeNetwork"><IconTrash /></q-btn>
       </div>
 
       <!-- Per-network settings for selected network -->
@@ -106,6 +106,16 @@
       </div>
 
       <template v-if="apEnabled">
+        <div class="row items-center no-wrap">
+          <div class="col-4 text-caption">Active for (s)</div>
+          <q-input class="col" type="number" dense outlined debounce="500" min="0"
+            :model-value="apActiveFor" @update:model-value="setApActiveFor" />
+        </div>
+        <div class="text-caption" style="opacity:0.5">
+          0: stay up until a known network appears. Otherwise the AP shuts
+          down after this many seconds without traffic, once per boot —
+          reboot to bring it back.
+        </div>
         <SettingText label="SSID" k="s.net.wifi.ap.ssid" />
         <SettingText label="Password" k="s.net.wifi.ap.pass" />
         <SettingText label="IP" k="s.net.wifi.ap.ip" />
@@ -140,6 +150,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { useDeviceStore } from 'spangap-browser/stores/device'
+import IconTrash from 'spangap-browser/components/IconTrash.vue'
 import WifiScanDialog from './WifiScanDialog.vue'
 
 const device = useDeviceStore()
@@ -317,17 +328,25 @@ function doDisconnect() { device.set('wifi.disconnect', 1) }
 
 // ---- AP ----
 
-const apEnabled = computed(() => !device.get('s.net.wifi.ap.disable'))
+// s.net.wifi.ap.active_for: -1 = AP disabled, 0 = up until a known network
+// appears, N>0 = AP shuts down after N idle seconds, once per boot.
+const apActiveFor = computed(() => Number(device.get('s.net.wifi.ap.active_for') ?? 300))
+const apEnabled = computed(() => apActiveFor.value >= 0)
 const showApWarning = ref(false)
 
 function onApToggle(val: boolean) {
   if (!val) showApWarning.value = true
-  else device.set('s.net.wifi.ap.disable', 0)
+  else device.set('s.net.wifi.ap.active_for', 300)
+}
+
+function setApActiveFor(val: string | number | null) {
+  const n = Math.max(0, Math.floor(Number(val ?? 0)) || 0)
+  device.set('s.net.wifi.ap.active_for', n)
 }
 
 function confirmApDisable() {
   showApWarning.value = false
-  device.set('s.net.wifi.ap.disable', 1)
+  device.set('s.net.wifi.ap.active_for', -1)
 }
 
 // ---- Scanning lifecycle: only while scan dialog is open ----

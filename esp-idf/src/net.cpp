@@ -59,6 +59,15 @@ static esp_netif_t* ap_netif = nullptr;
 /* Event-driven connection signaling */
 static SemaphoreHandle_t wifiConnectedSem = nullptr;
 static volatile bool staConnected = false;
+
+/* Set once per boot when sys.boot_complete fires (after every straddle's init
+ * hook and the boot script). The net task spins on this — pumping itsPoll so
+ * the subscription callback can actually run — before the initial radio
+ * bring-up: WiFi's driver control structs are heap-allocated in PSRAM, and a
+ * flash program/erase during the boot storm suspends the cache mid-write and
+ * corrupts them, later surfacing as a StoreProhibited in wifi_nvs_set /
+ * ieee80211_send_setup on ppTask. */
+static volatile bool s_bootComplete = false;
 static volatile bool cmdUp = false;
 static volatile bool cmdDown = false;
 static volatile bool cmdForceDown = false;
@@ -712,6 +721,15 @@ static void publishScanResults() {
 
   cJSON* arr = cJSON_CreateArray();
   for (int i = 0; i < ap_count; i++) {
+    /* One row per SSID: the list is RSSI-sorted, so the first occurrence is
+     * the loudest AP of that network — weaker same-SSID APs are dropped.
+     * Empty SSIDs (hidden networks) are distinct APs, keep them all. */
+    if (ap_list[i].ssid[0]) {
+      bool dup = false;
+      for (int j = 0; j < i && !dup; j++)
+        dup = strcmp((const char*)ap_list[j].ssid, (const char*)ap_list[i].ssid) == 0;
+      if (dup) continue;
+    }
     cJSON* obj = cJSON_CreateObject();
     cJSON_AddStringToObject(obj, "ssid", (const char*)ap_list[i].ssid);
     char bssid[18];
@@ -899,8 +917,26 @@ static bool connectSta(int idx) {
   return false;
 }
 
+/* s.net.wifi.ap.active_for policy:
+ *   -1  AP mode disabled, never start it.
+ *    0  AP stays up until a known network appears (the ap.retry rescan).
+ *   N>0 (default 300) AP shuts down after N seconds without link traffic,
+ *       once per boot. Any TCP traffic (a browser session) restarts the idle
+ *       timer, so the AP lives exactly as long as someone is using it, and a
+ *       pocketed device doesn't burn power beaconing. The device keeps
+ *       rescanning for known networks every ap.retry seconds (radio off in
+ *       between) — only the AP is spent; a reboot force-summons it. The
+ *       spent window survives deep sleep (RTC RAM) so cron wakes don't
+ *       re-arm it; any real reset reloads the RTC data segment and re-arms. */
+RTC_DATA_ATTR static bool rtcApWindowUsed = false;
+
 static bool startAP() {
-  if (storageGetInt("s.net.wifi.ap.disable")) { info("AP disabled\n"); return false; }
+  int activeFor = storageGetInt("s.net.wifi.ap.active_for", 300);
+  if (activeFor < 0) { info("AP disabled\n"); return false; }
+  if (activeFor > 0 && rtcApWindowUsed) {
+    info("AP window already used this boot\n");
+    return false;
+  }
   char ssid[33], pass[65], ip[16], mask[16];
   storageGetStr("s.net.wifi.ap.ssid", ssid, sizeof(ssid), WIFI_AP_SSID);
   storageGetStr("s.net.wifi.ap.pass", pass, sizeof(pass), WIFI_AP_PASS);
@@ -968,6 +1004,16 @@ static void doDown(wifi_state_t& state) {
   wifiState = ST_OFF;  /* sync before publishWifiStatus, so wifi.{sta,ap}.up=0 */
   pmLockRelease(netDeepLock);
   publishWifiStatus();
+}
+
+/* Stop + deinit the radio without the link-down ceremony — for leaving
+ * ST_SCANNING (the link was never up, so no NET_EV_DOWN / endpoint close).
+ * Previously these paths only released the PM lock and left the radio
+ * initialized and drawing power in "OFF". */
+static void radioOff() {
+  esp_wifi_stop();
+  esp_wifi_deinit();
+  pmLockRelease(netDeepLock);
 }
 
 static volatile bool cmdDisconnect = false;
@@ -1096,6 +1142,17 @@ static void netTaskFn(void* arg) {
     else                { info("wifi.enable=1 → bringing net up\n");   netUp(); }
   });
 
+  /* Boot-complete gate: spangapPostAppInit() sets sys.boot_complete after the
+   * whole init walk + boot script, so this fires exactly once, after the last
+   * boot-time flash writer. collectChanges notifies on every set (no old/new
+   * diff), so it fires even when the key persisted as 1 from a prior boot. The
+   * notify is delivered over ITS and only dispatched while this task is in
+   * itsPoll — the gate below keeps polling so this callback can run. */
+  storageSubscribeChanges("sys.boot_complete", ON_CHANGE {
+    if (strcmp(key, "sys.boot_complete") != 0) return;
+    s_bootComplete = true;
+  });
+
   wifiNetifInit();
 
   xSemaphoreGive(readySem);  /* unblock netInit — task is running */
@@ -1105,27 +1162,59 @@ static void netTaskFn(void* arg) {
   uint32_t scanStartMs = millis();
   uint32_t lastApRetryMs = 0;
   uint32_t lastStatusMs = 0;
+  uint32_t lastOffScanMs = millis();  /* last radio-down known-network rescan */
   /* Consecutive failed connects to a *seen* known network in ST_SCANNING.
    * Every exit from scanning (connected / AP fallback) resets it to 0. */
   int connectFails = 0;
   /* AP retry interval read from s.net.wifi.ap.retry (default 300s) */
 
   if (wantUp()) {
+    /* Hold the radio down until the boot init storm is over. The boot-complete
+     * notify arrives over ITS, so keep pumping itsPoll here for the callback to
+     * fire — a plain blocking wait would deadlock against its own signal. The
+     * config-change subs registered above all no-op while netIsUp() is false,
+     * so pumping ITS now can't bring the radio up early. The notify lands before
+     * the persist worker has flushed, so also storageSave()-drain: bring-up
+     * then meets idle flash and WiFi's PSRAM structs are written with the cache
+     * stable. Timeout backstops a wedged boot script so it can't strand WiFi. */
+    uint32_t gateStart = millis();
+    while (!s_bootComplete) {
+      if (millis() - gateStart >= 15000) {
+        info("boot-complete gate timed out — bringing WiFi up anyway\n");
+        break;
+      }
+      itsPoll(pdMS_TO_TICKS(50));
+    }
+    storageSave();
     pmLockAcquire(netDeepLock);
     setDhcpHostname();
     wifiHwStart(WIFI_MODE_STA);
     state = ST_SCANNING;
     if (staNetCount() == 0) {
       if (startAP()) { state = ST_AP; doUp(state); }
-      else { state = ST_OFF; pmLockRelease(netDeepLock); }
+      else { state = ST_OFF; radioOff(); }
     }
   }
 
   for (;;) {
     bool connected = (state == ST_STA_CONNECTED || state == ST_AP);
+    /* Radio down but still want-up with networks configured (spent AP window,
+     * or AP disabled): keep rescanning for a known network every ap.retry
+     * seconds so walking back into range reconnects — radio off in between. */
+    bool offRescan = (state == ST_OFF) && wantUp() && staNetCount() > 0;
 
-    /* Sleep when off; drain ITS (non-blocking when connected — select handles timing) */
-    { TickType_t t = (state == ST_OFF) ? portMAX_DELAY : 0;
+    /* Sleep when off; drain ITS (non-blocking when connected — select handles
+     * timing). With a rescan pending, sleep only until it is due. */
+    { TickType_t t = 0;
+      if (state == ST_OFF) {
+        if (offRescan) {
+          uint32_t retryMs = (uint32_t)storageGetInt("s.net.wifi.ap.retry", 300) * 1000;
+          uint32_t since = millis() - lastOffScanMs;
+          t = pdMS_TO_TICKS(since >= retryMs ? 1 : retryMs - since);
+        } else {
+          t = portMAX_DELAY;
+        }
+      }
       while (itsPoll(t)) { t = 0; } }
 
     /* Process command flags set by aux handler */
@@ -1242,6 +1331,26 @@ static void netTaskFn(void* arg) {
       continue;
     }
 
+    /* Periodic radio-down rescan (see offRescan above). One pass: radio up,
+     * single scan, connect on a hit, radio straight back off on a miss. */
+    if (offRescan && state == ST_OFF &&
+        millis() - lastOffScanMs >= (uint32_t)storageGetInt("s.net.wifi.ap.retry", 300) * 1000) {
+      lastOffScanMs = millis();
+      info("radio-down rescan for known networks\n");
+      pmLockAcquire(netDeepLock);
+      setDhcpHostname();
+      wifiHwStart(WIFI_MODE_STA);
+      int idx = scanForKnown();
+      if (idx >= 0 && connectSta(idx)) {
+        state = ST_STA_CONNECTED;
+        doUp(state);
+      } else {
+        radioOff();
+      }
+      wifiState = state;
+      continue;
+    }
+
     /* Graceful shutdown: want_up=0 + connected → wait for idle */
     if (!wantUp() && connected) {
       if (millis() - lastActivityMs >= WIFI_IDLE_TIMEOUT_MS) {
@@ -1286,7 +1395,7 @@ static void netTaskFn(void* arg) {
             info("connect to known network failed %dx, falling back to AP\n", connectFails);
             connectFails = 0;
             if (startAP()) { state = ST_AP; doUp(state); }
-            else { state = ST_OFF; pmLockRelease(netDeepLock); }
+            else { state = ST_OFF; radioOff(); lastOffScanMs = millis(); }
           } else {
             info("connect failed (attempt %d/%d), retrying\n", connectFails, WIFI_CONNECT_RETRIES);
             delay(2000);
@@ -1295,7 +1404,7 @@ static void netTaskFn(void* arg) {
           /* No known network even visible within the search window → AP. */
           connectFails = 0;
           if (startAP()) { state = ST_AP; doUp(state); }
-          else { state = ST_OFF; pmLockRelease(netDeepLock); }
+          else { state = ST_OFF; radioOff(); lastOffScanMs = millis(); }
         } else {
           delay(2000);
         }
@@ -1324,6 +1433,28 @@ static void netTaskFn(void* arg) {
         break;
       case ST_AP:
         netPollOnce();
+        /* Timed AP window (active_for > 0): once the link has seen no traffic
+         * for active_for seconds, spend the window and drop the radio.
+         * doUp() stamps lastActivityMs, so an untouched AP lives exactly
+         * active_for seconds; any TCP traffic restarts the timer, so an
+         * in-progress browser session keeps it alive instead of being cut
+         * off mid-config. rtcWantUp stays set: the radio-down rescan above
+         * keeps looking for known networks — only the AP is spent until the
+         * next reboot. Note the up-time in the log: the last "mode: softAP"
+         * driver line may be the ap.retry APSTA scan flipping back, not the
+         * AP start, which makes the window look shorter than it was. */
+        { int activeFor = storageGetInt("s.net.wifi.ap.active_for", 300);
+          if (activeFor > 0 &&
+              millis() - lastActivityMs >= (uint32_t)activeFor * 1000) {
+            info("AP idle for %d s (up %u s), AP off until reboot\n",
+                 activeFor, (unsigned)((millis() - connectTimeMs) / 1000));
+            rtcApWindowUsed = true;
+            lastOffScanMs = millis();
+            doDown(state);
+            wifiState = state;
+            continue;
+          }
+        }
         { uint32_t apRetryMs = (uint32_t)storageGetInt("s.net.wifi.ap.retry", 300) * 1000;
           if (staNetCount() > 0 && wantUp() && millis() - lastApRetryMs >= apRetryMs) {
             lastApRetryMs = millis();
@@ -1726,8 +1857,9 @@ static void netCliCmd(const char* args) {
 }
 
 /* Module config version. Bump when adding/changing defaults. See duckdns.cpp.
- * net owns its sub-domains: s.net.{hostname,*_port,mdns,wifi.*,dns.*}. */
-#define NET_VERSION 1
+ * net owns its sub-domains: s.net.{hostname,*_port,mdns,wifi.*,dns.*}.
+ * v2: ap.disable folded into ap.active_for (-1 = disabled). */
+#define NET_VERSION 2
 
 void netInit() {
   int v = storageGetInt("s.net.version", 0);
@@ -1752,7 +1884,8 @@ void netInit() {
           "pass": "",
           "ip":   "192.168.1.1",
           "mask": "255.255.255.0",
-          "retry": 300
+          "retry": 300,
+          "active_for": 300
         },
         "nets": []
       }
@@ -1771,6 +1904,10 @@ void netInit() {
       snprintf(apssid, sizeof(apssid), "%s_%02x%02x", host, mac[4], mac[5]);
       storageDefault("s.net.wifi.ap.ssid", apssid);
     }
+    /* v1 -> v2: the old boolean ap.disable becomes ap.active_for = -1. */
+    if (storageGetInt("s.net.wifi.ap.disable"))
+      storageSet("s.net.wifi.ap.active_for", -1);
+    storageUnset("s.net.wifi.ap.disable");
     storageSet("s.net.version", NET_VERSION);
   }
 
@@ -1796,7 +1933,10 @@ void netInit() {
    * this only seeded on cold boot, so a warm boot kept the preserved rtcWantUp=1
    * and scanned + brought up AP despite enable=0. */
   bool wifiEnabled = storageGetInt("s.net.wifi.enable", 1) != 0;
-  if (!rtcRamValid())    rtcWantUp = wifiEnabled;
+  if (!rtcRamValid()) {
+    rtcWantUp = wifiEnabled;
+    rtcApWindowUsed = false;   /* real reboot re-arms the timed AP window */
+  }
   else if (!wifiEnabled) rtcWantUp = false;
 
   readySem = xSemaphoreCreateBinary();

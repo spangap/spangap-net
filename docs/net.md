@@ -23,7 +23,15 @@ to make. On boot the task reads the master switch `s.net.wifi.enable`, then:
   (or none is configured), the device brings up its own access point so it is
   always reachable. From AP it keeps re-scanning every `s.net.wifi.ap.retry`
   seconds (non-disruptively, via APSTA) and switches to STA when a known network
-  appears.
+  appears. `s.net.wifi.ap.active_for` bounds this: `-1` never starts the AP,
+  `0` keeps it up until a known network appears, and `N>0` (default 300) shuts
+  the AP down after N seconds without link traffic, once per boot. Any TCP
+  traffic restarts the idle timer, so an active browser session keeps the AP
+  alive as long as it is used. After the window the device keeps rescanning
+  for known networks every `s.net.wifi.ap.retry` seconds (radio off between
+  passes) and reconnects as STA on a hit — only the AP is spent until the
+  next reboot. A pocketed device stops beaconing; rebooting force-summons
+  the AP. The spent window survives deep sleep, so cron wakes don't re-arm it.
 
 `net` distinguishes **link up** (STA *or* AP — `NET_EV_UP`) from **upstream up**
 (STA associated to a real network, internet reachable — `NET_EV_UPSTREAM_UP`).
@@ -130,7 +138,7 @@ Defaults are seeded into `s.net.*` on first boot.
 | `s.net.wifi.ap.ip` | `192.168.1.1` | AP gateway IP. |
 | `s.net.wifi.ap.mask` | `255.255.255.0` | AP netmask. |
 | `s.net.wifi.ap.retry` | `300` | Seconds between background re-scans while in AP mode. |
-| `s.net.wifi.ap.disable` | `0` | When `1`, never start the built-in AP. |
+| `s.net.wifi.ap.active_for` | `300` | `-1`: never start the AP. `0`: AP stays up until a known network appears. `N>0`: AP shuts down after N seconds without link traffic (traffic restarts the timer), once per boot; known-network rescans continue every `ap.retry` seconds, only the AP is spent until reboot. (Replaced `ap.disable` in config v2.) |
 | `s.net.wifi.nets` | `[]` | Array of known STA networks. |
 
 Each entry in `s.net.wifi.nets[i]` has: `ssid`, `pass`, and the optional
@@ -149,7 +157,7 @@ default MAC).
 | `wifi.sta.{ssid,rssi,channel,ip,router,netmask,dns,up}` | STA association detail. |
 | `wifi.ap.state` | `off` / `active`. |
 | `wifi.ap.{ssid,ip,netmask,up}` | AP detail when active. |
-| `wifi.scanned` | JSON array of nearby APs (`{ssid,bssid,rssi,locked}`, strongest first), published while a scan is requested. |
+| `wifi.scanned` | JSON array of nearby networks (`{ssid,bssid,rssi,locked}`, strongest first), published while a scan is requested. One row per SSID — when several APs serve the same network only the loudest is listed; hidden (empty-SSID) APs are kept individually. |
 
 ### Command sentinels (write to trigger; net clears them)
 

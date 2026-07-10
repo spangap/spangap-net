@@ -104,6 +104,23 @@ joined clients) and switches to STA on a hit. `doUp()` sets `s_linkUp` before
 firing `NET_EV_UP` and `setUpstream()`; `doDown()` clears it before firing
 `NET_EV_DOWN` — late-replay consistency depends on that ordering.
 
+With `s.net.wifi.ap.active_for` > 0 the AP is a one-shot idle window: the
+`ST_AP` loop tears the radio down (`doDown` → `ST_OFF`) once `lastActivityMs`
+is `active_for` seconds stale. `doUp()` stamps `lastActivityMs`, so an
+untouched AP lives exactly `active_for` seconds, and any TCP traffic (the
+relay's `netActivity()`) restarts the timer — an active browser session keeps
+the AP alive for as long as it is used. The spent flag (`rtcApWindowUsed`)
+lives in RTC RAM: preserved across deep sleep (cron wakes don't re-arm the
+AP), reloaded to false by any real reset, and `startAP()` refuses while it is
+set. `rtcWantUp` is deliberately left set, and `ST_OFF` with want-up + stored
+networks runs the radio-down rescan: every `ap.retry` seconds one pass of
+radio-up → `scanForKnown()` → connect on a hit / `radioOff()` on a miss, so
+walking back into range reconnects without a reboot — only the AP is spent.
+The same rescan covers `active_for = -1` (AP disabled) after a fruitless
+`ST_SCANNING` window. `radioOff()` (stop + deinit + PM-lock release) is also
+what the `ST_SCANNING` → `ST_OFF` fallbacks use — they previously left the
+radio initialized and drawing power in "OFF".
+
 `setUpstream(bool)` is idempotent (fires only on real transitions), writes the
 ephemeral `net.up` storage key the rns boot barrier waits on, and fires
 `NET_EV_UPSTREAM_{UP,DOWN}`. It's called both at each transition site and once

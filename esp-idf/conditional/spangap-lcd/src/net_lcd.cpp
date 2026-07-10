@@ -126,7 +126,7 @@ void rebuildKnown() {
     lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
     lv_obj_set_flex_grow(lbl, 1);
     mkBtn(r, "Join", onJoinKnown, (void*)(intptr_t)i);
-    mkBtn(r, "Del",  onDeleteKnown, (void*)(intptr_t)i);
+    mkBtn(r, LV_SYMBOL_TRASH, onDeleteKnown, (void*)(intptr_t)i);
   }
 }
 

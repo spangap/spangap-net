@@ -25,6 +25,32 @@ browser can still join a network.
 Each function's operator guide links to its `*-internals.md` maintainer
 reference.
 
+## Access-point lifetime
+
+When no known WiFi network is in range, the device brings up its own access
+point so it stays reachable. How long that AP lives is governed by
+`s.net.wifi.ap.active_for` (integer, default `300`):
+
+- **`-1`** — AP mode disabled; the AP never starts.
+- **`0`** — the AP stays up indefinitely, rescanning every
+  `s.net.wifi.ap.retry` seconds and switching to STA the moment a known
+  network appears.
+- **`N > 0`** — the AP shuts down after `N` seconds without link traffic,
+  **once per boot**. Any TCP traffic (an open browser session) restarts the
+  idle timer, so the AP lives exactly as long as someone is using it. The
+  device then keeps rescanning for known networks every
+  `s.net.wifi.ap.retry` seconds — radio off between passes — and reconnects
+  as STA when one appears; only the AP is spent until the next reboot. This
+  is the pocket mode: a device carried out of range doesn't burn power
+  beaconing an AP nobody will join, yet rebooting it force-summons the AP
+  for one more window. Deep-sleep wakes (cron) do not re-arm the spent
+  window — only a real reset does.
+
+The browser WiFi panel exposes this as an *Enable AP* toggle (off writes
+`-1`) plus an *Active for* seconds field shown while enabled. See
+[docs/net.md](docs/net.md) for the full key table and
+[docs/net-internals.md](docs/net-internals.md) for the state-machine detail.
+
 ## Bundled remote-access services
 
 Because every remote-access add-on hard-requires the IP stack, pulling in `net`
