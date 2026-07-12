@@ -49,6 +49,12 @@
  * full connect timeout) immediately drops us to AP. */
 #define WIFI_CONNECT_RETRIES 3
 
+/* Scans per search window: a scan that misses gets exactly one more try
+ * (a second scan catches APs the first one's channel dwell missed) before
+ * falling back to AP / radio-off. Replaces the old s.net.wifi.timeout
+ * time-based window, which kept the radio scanning for 20s per cycle. */
+#define WIFI_SCANS_PER_CYCLE 2
+
 static TaskHandle_t netHandle = nullptr;
 static SemaphoreHandle_t readySem = nullptr;
 
@@ -636,42 +642,51 @@ static void staNetDeleteIdx(int idx) {
   storageEnd();
 }
 
-static void logNetworks() {
-  int n = staNetCount();
-  info("known networks: %d\n", n);
-  for (int i = 0; i < n; i++) {
-    char ssid[33];
-    staNetGet(i, "ssid", ssid, sizeof(ssid));
-    info("  [%d] '%s'\n", i, ssid);
-  }
-}
-
 static int scanForKnown() {
-  info("scanning...\n");
   esp_wifi_scan_stop();   /* drop any wedged/in-flight scan left by a prior attempt */
   wifi_scan_config_t scan_config = {};
   esp_err_t e = esp_wifi_scan_start(&scan_config, true);
   if (e != ESP_OK) { info("scan start failed: %s\n", esp_err_to_name(e)); return -1; }
   uint16_t ap_count = 0;
   esp_wifi_scan_get_ap_num(&ap_count);
-  if (ap_count == 0) { info("scan found 0 networks\n"); return -1; }
-  info("scan found %d networks\n", ap_count);
+  int nNets = staNetCount();
+  if (ap_count == 0) {
+    info("0 Access Points found, none of our %d known networks in range\n", nNets);
+    return -1;
+  }
   wifi_ap_record_t* ap_list = (wifi_ap_record_t*)gp_alloc(ap_count * sizeof(wifi_ap_record_t));
   if (!ap_list) return -1;
   esp_wifi_scan_get_ap_records(&ap_count, ap_list);
-  for (int i = 0; i < ap_count; i++)
+  /* Hidden networks (empty SSID) collapse into one "unique SSID" — good
+   * enough for a summary count. */
+  int uniq = 0;
+  for (int i = 0; i < ap_count; i++) {
     dbg("  '%s' ch%d %ddBm\n", (const char*)ap_list[i].ssid, ap_list[i].primary, ap_list[i].rssi);
+    bool dup = false;
+    for (int j = 0; j < i && !dup; j++)
+      dup = strcmp((const char*)ap_list[j].ssid, (const char*)ap_list[i].ssid) == 0;
+    if (!dup) uniq++;
+  }
   int bestIdx = -1;
-  int nNets = staNetCount();
-  logNetworks();
+  char matched[33] = "";
   for (int s = 0; s < nNets; s++) {
     char ssid[33];
     staNetGet(s, "ssid", ssid, sizeof(ssid));
     for (int i = 0; i < ap_count; i++)
-      if (strcmp((const char*)ap_list[i].ssid, ssid) == 0) { bestIdx = s; goto found; }
+      if (strcmp((const char*)ap_list[i].ssid, ssid) == 0) {
+        bestIdx = s;
+        memcpy(matched, ssid, sizeof(matched));
+        goto found;
+      }
   }
 found:
   free(ap_list);
+  if (bestIdx >= 0)
+    info("%d different Access Points, %d unique SSIDs, found our known network '%s'\n",
+         ap_count, uniq, matched);
+  else
+    info("%d different Access Points, %d unique SSIDs, none of our %d known networks found\n",
+         ap_count, uniq, nNets);
   return bestIdx;
 }
 
@@ -1011,6 +1026,7 @@ static void doDown(wifi_state_t& state) {
  * Previously these paths only released the PM lock and left the radio
  * initialized and drawing power in "OFF". */
 static void radioOff() {
+  info("Turning off wifi\n");
   esp_wifi_stop();
   esp_wifi_deinit();
   pmLockRelease(netDeepLock);
@@ -1157,9 +1173,10 @@ static void netTaskFn(void* arg) {
 
   xSemaphoreGive(readySem);  /* unblock netInit — task is running */
 
-  int searchTimeout = storageGetInt("s.net.wifi.timeout");
   wifi_state_t state = ST_OFF;
-  uint32_t scanStartMs = millis();
+  /* Missed scans in the current ST_SCANNING window — WIFI_SCANS_PER_CYCLE
+   * misses fall back to AP / radio-off. Reset on every window (re)start. */
+  int scanMisses = 0;
   uint32_t lastApRetryMs = 0;
   uint32_t lastStatusMs = 0;
   uint32_t lastOffScanMs = millis();  /* last radio-down known-network rescan */
@@ -1188,6 +1205,7 @@ static void netTaskFn(void* arg) {
     storageSave();
     pmLockAcquire(netDeepLock);
     setDhcpHostname();
+    if (staNetCount() > 0) info("Bringing up STA mode to scan for wifi networks\n");
     wifiHwStart(WIFI_MODE_STA);
     state = ST_SCANNING;
     if (staNetCount() == 0) {
@@ -1229,12 +1247,12 @@ static void netTaskFn(void* arg) {
       cmdUp = false;
       rtcWantUp = true;
       if (state == ST_OFF) {
-        info("coming up\n");
+        info("Bringing up STA mode to scan for wifi networks\n");
         pmLockAcquire(netDeepLock);
         setDhcpHostname();
         wifiHwStart(WIFI_MODE_STA);
         state = ST_SCANNING;
-        scanStartMs = millis();
+        scanMisses = 0;
         wifiState = state;
       }
     }
@@ -1259,7 +1277,7 @@ static void netTaskFn(void* arg) {
         epCloseAll();
         esp_wifi_disconnect();
         if (startAP()) { state = ST_AP; doUp(state); }
-        else { state = ST_SCANNING; scanStartMs = millis(); }
+        else { state = ST_SCANNING; scanMisses = 0; }
         wifiState = state;
         publishWifiStatus();
         continue;
@@ -1287,7 +1305,7 @@ static void netTaskFn(void* arg) {
           /* Connect failed — stay in or start AP */
           if (state != ST_AP) {
             if (startAP()) { state = ST_AP; doUp(state); }
-            else { state = ST_SCANNING; scanStartMs = millis(); }
+            else { state = ST_SCANNING; scanMisses = 0; }
           } else {
             esp_wifi_set_mode(WIFI_MODE_AP);
             doUp(state);
@@ -1332,15 +1350,17 @@ static void netTaskFn(void* arg) {
     }
 
     /* Periodic radio-down rescan (see offRescan above). One pass: radio up,
-     * single scan, connect on a hit, radio straight back off on a miss. */
+     * WIFI_SCANS_PER_CYCLE scans, connect on a hit, radio straight back off
+     * on a miss. */
     if (offRescan && state == ST_OFF &&
         millis() - lastOffScanMs >= (uint32_t)storageGetInt("s.net.wifi.ap.retry", 300) * 1000) {
       lastOffScanMs = millis();
-      info("radio-down rescan for known networks\n");
+      info("Bringing up STA mode to scan for wifi networks\n");
       pmLockAcquire(netDeepLock);
       setDhcpHostname();
       wifiHwStart(WIFI_MODE_STA);
       int idx = scanForKnown();
+      for (int s = 1; idx < 0 && s < WIFI_SCANS_PER_CYCLE; s++) idx = scanForKnown();
       if (idx >= 0 && connectSta(idx)) {
         state = ST_STA_CONNECTED;
         doUp(state);
@@ -1384,6 +1404,7 @@ static void netTaskFn(void* arg) {
       case ST_SCANNING: {
         int idx = scanForKnown();
         if (idx >= 0) {
+          scanMisses = 0;
           /* A known network is in range. Give it WIFI_CONNECT_RETRIES attempts
            * before falling back to AP — a flaky AP or slow DHCP shouldn't bump
            * us off the network the user actually wants on the first miss. */
@@ -1400,8 +1421,9 @@ static void netTaskFn(void* arg) {
             info("connect failed (attempt %d/%d), retrying\n", connectFails, WIFI_CONNECT_RETRIES);
             delay(2000);
           }
-        } else if (millis() - scanStartMs >= (uint32_t)(searchTimeout * 1000)) {
-          /* No known network even visible within the search window → AP. */
+        } else if (++scanMisses >= WIFI_SCANS_PER_CYCLE) {
+          /* No known network visible after WIFI_SCANS_PER_CYCLE scans → AP. */
+          scanMisses = 0;
           connectFails = 0;
           if (startAP()) { state = ST_AP; doUp(state); }
           else { state = ST_OFF; radioOff(); lastOffScanMs = millis(); }
@@ -1428,7 +1450,7 @@ static void netTaskFn(void* arg) {
             esp_wifi_set_config(WIFI_IF_STA, &clear); }
           /* Keep PM lock — still want_up, will reconnect */
           state = ST_SCANNING;
-          scanStartMs = millis();
+          scanMisses = 0;
         }
         break;
       case ST_AP:

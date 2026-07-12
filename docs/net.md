@@ -19,8 +19,8 @@ to make. On boot the task reads the master switch `s.net.wifi.enable`, then:
   with the first match (strongest-RSSI handling is in the scan). DHCP by
   default, or a per-network static IP. A flaky association gets three attempts
   before falling back to AP.
-- **AP** — if no known network is in range within `s.net.wifi.timeout` seconds
-  (or none is configured), the device brings up its own access point so it is
+- **AP** — if no known network is visible after two scans (or none is
+  configured), the device brings up its own access point so it is
   always reachable. From AP it keeps re-scanning every `s.net.wifi.ap.retry`
   seconds (non-disruptively, via APSTA) and switches to STA when a known network
   appears. `s.net.wifi.ap.active_for` bounds this: `-1` never starts the AP,
@@ -132,7 +132,6 @@ Defaults are seeded into `s.net.*` on first boot.
 | `s.net.mdns.https` | `443` | mDNS `_https._tcp` advertised port. |
 | `s.net.dns.fqdn` | `""` | Public FQDN (set by [duckdns](../../duckdns) / [acme](../../acme); read by services that need the external name). |
 | `s.net.wifi.enable` | `1` | Master radio switch. Setting `0` brings WiFi down live and survives reboot. |
-| `s.net.wifi.timeout` | `20` | Seconds to look for a known network before falling back to AP. |
 | `s.net.wifi.ap.ssid` | `<hostname>_<MAC last 2 bytes>` | AP SSID — computed per-device on first boot so a fleet doesn't present identical APs (e.g. `reticulous_dcbc`). User-editable after. |
 | `s.net.wifi.ap.pass` | `""` | AP password (`""` = open network). |
 | `s.net.wifi.ap.ip` | `192.168.1.1` | AP gateway IP. |
