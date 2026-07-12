@@ -117,7 +117,9 @@ networks runs the radio-down rescan: every `ap.retry` seconds one pass of
 radio-up → `scanForKnown()` → connect on a hit / `radioOff()` on a miss, so
 walking back into range reconnects without a reboot — only the AP is spent.
 The same rescan covers `active_for = -1` (AP disabled) after a fruitless
-`ST_SCANNING` window. `radioOff()` (stop + deinit + PM-lock release) is also
+`ST_SCANNING` window. Writing `-1` while the AP is live (the settings toggle)
+drops it on the next `ST_AP` iteration without spending the window —
+`rtcApWindowUsed` stays clear, so re-enabling later can start it again. `radioOff()` (stop + deinit + PM-lock release) is also
 what the `ST_SCANNING` → `ST_OFF` fallbacks use — they previously left the
 radio initialized and drawing power in "OFF".
 

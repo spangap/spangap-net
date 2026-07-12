@@ -137,7 +137,7 @@ Defaults are seeded into `s.net.*` on first boot.
 | `s.net.wifi.ap.ip` | `192.168.1.1` | AP gateway IP. |
 | `s.net.wifi.ap.mask` | `255.255.255.0` | AP netmask. |
 | `s.net.wifi.ap.retry` | `300` | Seconds between background re-scans while in AP mode. |
-| `s.net.wifi.ap.active_for` | `300` | `-1`: never start the AP. `0`: AP stays up until a known network appears. `N>0`: AP shuts down after N seconds without link traffic (traffic restarts the timer), once per boot; known-network rescans continue every `ap.retry` seconds, only the AP is spent until reboot. (Replaced `ap.disable` in config v2.) |
+| `s.net.wifi.ap.active_for` | `300` | `-1`: never start the AP (setting it while the AP is live drops it immediately). `0`: AP stays up until a known network appears. `N>0`: AP shuts down after N seconds without link traffic (traffic restarts the timer), once per boot; known-network rescans continue every `ap.retry` seconds, only the AP is spent until reboot. (Replaced `ap.disable` in config v2.) |
 | `s.net.wifi.nets` | `[]` | Array of known STA networks. |
 
 Each entry in `s.net.wifi.nets[i]` has: `ssid`, `pass`, and the optional

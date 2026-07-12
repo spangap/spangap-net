@@ -933,7 +933,8 @@ static bool connectSta(int idx) {
 }
 
 /* s.net.wifi.ap.active_for policy:
- *   -1  AP mode disabled, never start it.
+ *   -1  AP mode disabled, never start it. Written while the AP is live
+ *       (settings toggle), the ST_AP loop drops it immediately.
  *    0  AP stays up until a known network appears (the ap.retry rescan).
  *   N>0 (default 300) AP shuts down after N seconds without link traffic,
  *       once per boot. Any TCP traffic (a browser session) restarts the idle
@@ -947,9 +948,9 @@ RTC_DATA_ATTR static bool rtcApWindowUsed = false;
 
 static bool startAP() {
   int activeFor = storageGetInt("s.net.wifi.ap.active_for", 300);
-  if (activeFor < 0) { info("AP disabled\n"); return false; }
+  if (activeFor < 0) { dbg("AP disabled\n"); return false; }
   if (activeFor > 0 && rtcApWindowUsed) {
-    info("AP window already used this boot\n");
+    dbg("AP window already used this boot\n");
     return false;
   }
   char ssid[33], pass[65], ip[16], mask[16];
@@ -1466,6 +1467,19 @@ static void netTaskFn(void* arg) {
          * driver line may be the ap.retry APSTA scan flipping back, not the
          * AP start, which makes the window look shorter than it was. */
         { int activeFor = storageGetInt("s.net.wifi.ap.active_for", 300);
+          /* Disabled while live (settings toggle): drop the AP on the spot.
+           * The window isn't "spent" — rtcApWindowUsed stays clear, so
+           * re-enabling later can start it again. The OFF-state rescan keeps
+           * looking for known networks; startAP() itself refuses while
+           * active_for < 0, so the AP won't come back until re-enabled. */
+          if (activeFor < 0) {
+            info("AP disabled, dropping (up %u s)\n",
+                 (unsigned)((millis() - connectTimeMs) / 1000));
+            lastOffScanMs = millis();
+            doDown(state);
+            wifiState = state;
+            continue;
+          }
           if (activeFor > 0 &&
               millis() - lastActivityMs >= (uint32_t)activeFor * 1000) {
             info("AP idle for %d s (up %u s), AP off until reboot\n",
