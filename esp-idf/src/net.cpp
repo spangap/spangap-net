@@ -163,6 +163,15 @@ struct net_client_t {
     int itsHandle;    /* ITS client handle (-1 = inactive) */
     int epIdx;
     TaskHandle_t serverTask;
+    /* ITS→socket staging (PSRAM, 4096, allocated once at init). Bytes
+     * consumed from ITS but not yet accepted by the kernel wait here
+     * across loop passes; [txOff, txLen) is the unsent remainder. The fd
+     * joins the select() write set only while data is pending, so a peer
+     * with a full send buffer parks its remainder instead of stalling
+     * the net task. */
+    uint8_t* txBuf;
+    size_t   txLen;
+    size_t   txOff;
 };
 
 static net_endpoint_t netEps[NET_MAX_ENDPOINTS];
@@ -276,6 +285,8 @@ static void netClientClose(net_client_t& c) {
     else if (c.fd >= 0) close(c.fd);
     c.fd = -1;
     c.tlsConn = nullptr;
+    c.txLen = 0;
+    c.txOff = 0;
 }
 
 static void epCloseAll() {
@@ -305,7 +316,12 @@ static void netAcceptOne(int ei, int fd, tls_conn_t* conn, struct sockaddr_in* p
     int h = itsConnectByTaskHandle(ep.task, ep.itsPort, &cd, sizeof(cd),
                                     pdMS_TO_TICKS(1000), -1, nullptr, netItsDisconnect);
     if (h < 0) { if (conn) tlsClose(conn); else close(fd); return; }
-    netClients[ci] = { fd, conn, h, ei, ep.task };
+    /* Field-wise, NOT aggregate: an aggregate assignment would zero txBuf,
+     * the staging buffer allocated once at task start. */
+    net_client_t& nc = netClients[ci];
+    nc.fd = fd; nc.tlsConn = conn; nc.itsHandle = h;
+    nc.epIdx = ei; nc.serverTask = ep.task;
+    nc.txLen = 0; nc.txOff = 0;
 }
 
 /* Unified select on all server fds + client fds, then accept + proxy */
@@ -313,8 +329,9 @@ static void netPollOnce() {
     while (itsPoll(0)) {}
     epOpenAll();
 
-    fd_set rfds;
+    fd_set rfds, wfds;
     FD_ZERO(&rfds);
+    FD_ZERO(&wfds);
     int maxFd = -1;
 
     for (int i = 0; i < netEpCount; i++) {
@@ -322,10 +339,29 @@ static void netPollOnce() {
         if (sfd >= 0) { FD_SET(sfd, &rfds); if (sfd > maxFd) maxFd = sfd; }
     }
     for (int i = 0; i < NET_MAX_CLIENTS; i++) {
-        if (netClients[i].fd >= 0) {
-            FD_SET(netClients[i].fd, &rfds);
-            if (netClients[i].fd > maxFd) maxFd = netClients[i].fd;
+        auto& c = netClients[i];
+        if (c.fd < 0) continue;
+        /* Write set: only while there is something to push (a parked
+         * remainder or fresh ITS bytes) — a bare TCP socket is almost
+         * always writable, so including it unconditionally would make
+         * select() return instantly and spin the task. */
+        if (c.txLen > c.txOff ||
+            (c.itsHandle >= 0 && itsBytesAvailable(c.itsHandle) > 0)) {
+            FD_SET(c.fd, &wfds);
+            if (c.fd > maxFd) maxFd = c.fd;
         }
+        /* Read set — backpressure: when the ITS stream toward the owning
+         * task is full (owner busy and not draining), leave the socket
+         * unread — the kernel buffer fills and TCP flow control throttles
+         * the remote sender. Previously the bytes were read anyway and
+         * handed to itsSend(…, 0) with the result ignored, silently
+         * discarding up-to-4 KB chunks mid-stream and corrupting the
+         * owner's framing. Skipping FD_SET (rather than skipping just the
+         * recv) keeps select() from returning instantly on the unread fd
+         * and spinning the task hot for the whole stall. */
+        if (c.itsHandle >= 0 && itsSpacesAvailable(c.itsHandle) == 0) continue;
+        FD_SET(c.fd, &rfds);
+        if (c.fd > maxFd) maxFd = c.fd;
     }
 
     /* This is the net task's real block point, and it is timeout-driven, not
@@ -339,7 +375,7 @@ static void netPollOnce() {
     pmBoostAuto(false);
     if (maxFd >= 0) {
         struct timeval tv = { 0, 10000 };
-        select(maxFd + 1, &rfds, NULL, NULL, &tv);
+        select(maxFd + 1, &rfds, &wfds, NULL, &tv);
     } else {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
@@ -400,9 +436,15 @@ static void netPollOnce() {
 
         bool canRecv = FD_ISSET(c.fd, &rfds);
         if (!canRecv && c.tlsConn && tlsBytesAvail(c.tlsConn) > 0) canRecv = true;
-        if (canRecv) {
-            int n = c.tlsConn ? tlsRead(c.tlsConn, netProxyBuf, 4096)
-                              : recv(c.fd, netProxyBuf, 4096, MSG_DONTWAIT);
+        /* Clamp the read to what the ITS stream can absorb right now, so the
+         * itsSend below can never overflow-drop (see the FD_SET backpressure
+         * note above; this covers the tlsBytesAvail path and space shrinking
+         * between the FD_SET pass and here). */
+        size_t space = itsSpacesAvailable(c.itsHandle);
+        if (canRecv && space > 0) {
+            size_t want = space < 4096 ? space : 4096;   /* netProxyBuf size */
+            int n = c.tlsConn ? tlsRead(c.tlsConn, netProxyBuf, want)
+                              : recv(c.fd, netProxyBuf, want, MSG_DONTWAIT);
             /* Close on dead peer. TLS: tlsRead maps real error/EOF to <0 and
              * no-data (WANT_READ) to 0. Raw recv is the opposite — 0 is EOF,
              * <0 is either no-data (EAGAIN) or a real error (ECONNRESET, or
@@ -416,19 +458,34 @@ static void netPollOnce() {
             if (n > 0) { itsSend(c.itsHandle, netProxyBuf, n, 0); netActivity(); trafficIn += n; }
         }
 
-        for (int rounds = 0; rounds < 4; rounds++) {
-            size_t n = itsRecv(c.itsHandle, netProxyBuf, 4096, 0);
-            if (n == 0) break;
-            trafficOut += n;
-            const uint8_t* p = netProxyBuf;
-            size_t rem = n;
-            while (rem > 0) {
-                int sent = c.tlsConn ? tlsWrite(c.tlsConn, p, rem)
-                                     : send(c.fd, p, rem, MSG_DONTWAIT);
-                if (sent <= 0) { netClientClose(c); goto nextClient; }
-                p += sent; rem -= sent;
+        /* ITS → socket, gated on write-readiness so one peer's full send
+         * buffer never stalls the whole net task. A would-block mid-chunk
+         * parks the remainder in c.txBuf ([txOff, txLen)); the fd stays in
+         * the select() write set while anything is pending, so we resume
+         * the moment the kernel drains. tlsWrite maps WANT_READ/WANT_WRITE
+         * to 0, raw send gives EAGAIN — neither is a dead peer. */
+        if (FD_ISSET(c.fd, &wfds) && c.txBuf) {
+            for (int rounds = 0; rounds < 4; rounds++) {
+                if (c.txOff >= c.txLen) {
+                    c.txOff = c.txLen = 0;
+                    size_t n = itsRecv(c.itsHandle, c.txBuf, 4096, 0);
+                    if (n == 0) break;
+                    c.txLen = n;
+                    trafficOut += n;
+                }
+                while (c.txOff < c.txLen) {
+                    int sent = c.tlsConn
+                        ? tlsWrite(c.tlsConn, c.txBuf + c.txOff, c.txLen - c.txOff)
+                        : send(c.fd, c.txBuf + c.txOff, c.txLen - c.txOff, MSG_DONTWAIT);
+                    bool wouldBlock = c.tlsConn
+                        ? (sent == 0)
+                        : (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+                    if (wouldBlock) goto nextClient;   /* parked; wfds re-arms */
+                    if (sent <= 0) { netClientClose(c); goto nextClient; }
+                    c.txOff += sent;
+                }
+                netActivity();
             }
-            netActivity();
         }
         nextClient:;
     }
@@ -550,7 +607,11 @@ static int netOnDialConnect(int handle, const void* data, size_t len) {
     int intvl = 10; setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
     int cnt = 3;   setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
 
-    netClients[ci] = { fd, nullptr, handle, -1, nullptr };
+    /* Field-wise for the same reason as netAcceptOne: keep txBuf. */
+    net_client_t& nc = netClients[ci];
+    nc.fd = fd; nc.tlsConn = nullptr; nc.itsHandle = handle;
+    nc.epIdx = -1; nc.serverTask = nullptr;
+    nc.txLen = 0; nc.txOff = 0;
     return ci;
 }
 
@@ -1067,6 +1128,9 @@ static void netTaskFn(void* arg) {
   /* Allocate the proxy buffer in task context so heap tracking attributes it
      to net, not the main task that spawned us. */
   netProxyBuf = (uint8_t*)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
+  /* Per-client ITS→socket staging buffers (see net_client_t::txBuf). */
+  for (int i = 0; i < NET_MAX_CLIENTS; i++)
+      netClients[i].txBuf = (uint8_t*)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
   itsClientInit(NET_MAX_CLIENTS);
   itsServerInit();
   itsServerPortOpen(NET_PORT_TCP_DIAL, /*packetBased=*/false,

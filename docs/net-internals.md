@@ -43,7 +43,11 @@ The task owns:
 - **The endpoint table** (`netEps`, ≤8) and the **client table** (`netClients`,
   ≤8) — every active relayed connection, inbound or dialed.
 - **The 4 KB PSRAM proxy buffer** (`netProxyBuf`), allocated in task context so
-  heap accounting attributes it to net.
+  heap accounting attributes it to net, plus a **per-client 4 KB staging buffer**
+  (`net_client_t::txBuf`, allocated once at task start) holding an ITS→socket
+  remainder the kernel wouldn't accept — which is why the client-slot setup in
+  `netAcceptOne`/`netOnDialConnect` assigns field-wise, never by aggregate
+  (that would zero `txBuf`).
 
 `netInit()` runs on the auto-init dispatcher (main_task). Anything that must
 outlive `app_main` — the storage subscriptions, the core-port registration — is
@@ -74,9 +78,21 @@ fds, then:
    off fast; otherwise `tlsAccept()` runs the handshake. `TCP_NODELAY` is set by
    default; `SO_KEEPALIVE` (10 s idle / 5 s × 3 probes) when the endpoint asked
    for it. A `net_connect_t` carries `ws=0, tls, clientAddr` to the owner.
-2. **Relay** each client both ways through `netProxyBuf`: socket→ITS
-   (`itsSend(..,0)` — drop on a full inbox) and ITS→socket (up to 4 rounds per
-   poll). Dead-peer detection is asymmetric and load-bearing — see pitfalls.
+2. **Relay** each client both ways, with backpressure in both directions.
+   *socket→ITS* (through `netProxyBuf`): a client fd joins the read set only
+   while the ITS stream toward the owner has space — a full stream leaves the
+   socket unread so the kernel buffer fills and TCP flow control throttles the
+   remote sender (skipping the `FD_SET`, not just the `recv`, keeps `select()`
+   from returning instantly on the unread fd and spinning); the read is
+   additionally clamped to the space left, so `itsSend` can never
+   overflow-drop mid-stream and corrupt the owner's framing. *ITS→socket*
+   (through the client's own `txBuf`, up to 4 rounds per poll): gated on
+   `select()` write-readiness — the fd joins the write set only while data is
+   pending, since a bare TCP socket is almost always writable — and a
+   would-block mid-chunk parks the remainder in `[txOff, txLen)` to resume
+   when the kernel drains, so one peer's full send buffer never stalls the
+   whole net task. Dead-peer detection is asymmetric and load-bearing — see
+   pitfalls.
 
 `netRegisterCorePorts()` registers `cli`/`log` by resolving their tasks with
 `xTaskGetHandle` (ITS names them `"cli"` / `"log"`); the dependency runs
