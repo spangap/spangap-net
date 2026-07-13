@@ -641,8 +641,23 @@ static void wifi_event_handler(void* arg, esp_event_base_t base,
     xSemaphoreGive(wifiConnectedSem);
   }
   else if (base == IP_EVENT && id == IP_EVENT_GOT_IP6) {
+    /* esp_netif re-posts GOT_IP6 on every state transition into VALID (ND6
+     * re-validates the link-local ~1 Hz while soliciting a router), so log only
+     * when the address actually changes to avoid a heartbeat of duplicates. */
     ip_event_got_ip6_t* e = (ip_event_got_ip6_t*)data;
-    info("net: IPv6 " IPV6STR "\n", IPV62STR(e->ip6_info.ip));
+    static esp_ip6_addr_t lastLogged = {};
+    if (memcmp(&lastLogged.addr, &e->ip6_info.ip.addr, sizeof(lastLogged.addr)) == 0)
+      return;
+    lastLogged = e->ip6_info.ip;
+    const char* scope;
+    switch (esp_netif_ip6_get_addr_type(&e->ip6_info.ip)) {
+      case ESP_IP6_ADDR_IS_GLOBAL:       scope = "global";     break;
+      case ESP_IP6_ADDR_IS_LINK_LOCAL:   scope = "link-local"; break;
+      case ESP_IP6_ADDR_IS_SITE_LOCAL:   scope = "site-local"; break;
+      case ESP_IP6_ADDR_IS_UNIQUE_LOCAL: scope = "unique-local"; break;
+      default:                           scope = "other";      break;
+    }
+    info("net: IPv6 %s " IPV6STR "\n", scope, IPV62STR(e->ip6_info.ip));
   }
 }
 
