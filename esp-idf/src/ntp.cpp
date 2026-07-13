@@ -21,6 +21,7 @@
 #include <sys/time.h>
 #include "esp_sntp.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -30,7 +31,18 @@ static const time_t VALID_EPOCH = 1735689600;  /* 2025-01-01 00:00:00 UTC */
 static bool timeValid() { return time(nullptr) >= VALID_EPOCH; }
 
 static void updateTimeValid() {
-  storageSet("sys.time.valid", timeValid() ? 1 : 0);
+  bool valid = timeValid();
+  storageSet("sys.time.valid", valid ? 1 : 0);
+  /* Publish the wall-clock instant this device booted, so consumers can turn a
+   * monotonic (since-boot) timestamp into real Unix time:
+   *     unix_of_event = sys.boot_time + monotonic_seconds_of_event
+   * The browser uses this to age the lxmf announce catalogue, whose stamps are
+   * esp_timer seconds-since-boot (not wall time — an offline device has none).
+   * Only meaningful once the clock is valid; recomputed on every clock step
+   * (SNTP sync, browser sys.time.set, CLI date) so it tracks adjustments. */
+  if (valid)
+    storageSet("sys.boot_time",
+               (int)(time(nullptr) - (time_t)(esp_timer_get_time() / 1000000)));
 }
 
 /* SNTP sync notification: lwIP calls this after a successful poll sets the
