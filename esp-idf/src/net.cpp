@@ -1414,9 +1414,11 @@ static void netTaskFn(void* arg) {
         int idx = staNetFindBySsid(ssid.c_str());
         if (idx < 0) idx = staNetCount();
         char k[64], v[8];
+        storageBegin();
         snprintf(k, sizeof(k), "s.net.wifi.nets.%d.ssid", idx); storageSet(k, ssid.c_str());
         snprintf(k, sizeof(k), "s.net.wifi.nets.%d.pass", idx); storageSet(k, pass.c_str());
         snprintf(v, sizeof(v), "%d", idx); storageSet("wifi.connect", v);
+        storageEnd();
         info("on-device add '%s' at %d — joining\n", ssid.c_str(), idx);
       }
       continue;
@@ -1856,8 +1858,10 @@ static void netCliCmd(const char* args) {
         int idx = staNetFindBySsid(ssid);
         if (idx < 0) idx = staNetCount();
         char k[64];
+        storageBegin();
         snprintf(k, sizeof(k), "s.net.wifi.nets.%d.ssid", idx); storageSet(k, ssid);
         snprintf(k, sizeof(k), "s.net.wifi.nets.%d.pass", idx); storageSet(k, pass);
+        storageEnd();
         cliPrintf("saved '%s' at index %d%s\n", ssid, idx, *pass ? "" : " (open)");
         /* Join immediately when we're not already on a real station — i.e.
          * sitting on the built-in AP, scanning, or off. A freshly added
@@ -2020,10 +2024,12 @@ void netInit() {
       storageDefault("s.net.wifi.ap.ssid", apssid);
     }
     /* v1 -> v2: the old boolean ap.disable becomes ap.active_for = -1. */
+    storageBegin();
     if (storageGetInt("s.net.wifi.ap.disable"))
       storageSet("s.net.wifi.ap.active_for", -1);
     storageUnset("s.net.wifi.ap.disable");
     storageSet("s.net.version", NET_VERSION);
+    storageEnd();
   }
 
   /* Suppress noisy WiFi driver block-ack renegotiation logs */

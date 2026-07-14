@@ -32,6 +32,7 @@ static bool timeValid() { return time(nullptr) >= VALID_EPOCH; }
 
 static void updateTimeValid() {
   bool valid = timeValid();
+  storageBegin();
   storageSet("sys.time.valid", valid ? 1 : 0);
   /* Publish the wall-clock instant this device booted, so consumers can turn a
    * monotonic (since-boot) timestamp into real Unix time:
@@ -43,6 +44,7 @@ static void updateTimeValid() {
   if (valid)
     storageSet("sys.boot_time",
                (int)(time(nullptr) - (time_t)(esp_timer_get_time() / 1000000)));
+  storageEnd();
 }
 
 /* SNTP sync notification: lwIP calls this after a successful poll sets the
@@ -281,8 +283,10 @@ void ntpInit() {
      * loose file ships via the factory image / browser PUT. No-op when the
      * key is absent (e.g. fresh devices). The cached s.ntp.posix from v1
      * survives, so TZ stays applied even before the new file arrives. */
+    storageBegin();
     if (v < 2) storageDeleteTree("s.time.zones");
     storageSet("s.ntp.version", NTP_VERSION);
+    storageEnd();
   }
 
   /* Fire updateTimeValid() on every successful background SNTP sync — the
