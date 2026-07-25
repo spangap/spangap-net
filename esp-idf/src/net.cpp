@@ -718,6 +718,24 @@ static void staNetDeleteIdx(int idx) {
   storageEnd();
 }
 
+/* SSIDs already announced via `scan found` this boot. Each network is named at
+ * info exactly once, but across ALL scans — a network that only shows up in a
+ * later scan still gets named, so the full environment (and the flasher's
+ * connect-helper list) accumulates. Reset only by a real reboot. */
+#define SCAN_LOG_MAX 64
+static char loggedSsids[SCAN_LOG_MAX][33];
+static int  loggedSsidCount = 0;
+
+static bool ssidAlreadyLogged(const char* ssid) {
+  for (int i = 0; i < loggedSsidCount; i++)
+    if (strcmp(loggedSsids[i], ssid) == 0) return true;
+  return false;
+}
+static void markSsidLogged(const char* ssid) {
+  if (loggedSsidCount < SCAN_LOG_MAX)
+    safeStrncpy(loggedSsids[loggedSsidCount++], ssid, sizeof(loggedSsids[0]));
+}
+
 static int scanForKnown() {
   esp_wifi_scan_stop();   /* drop any wedged/in-flight scan left by a prior attempt */
   wifi_scan_config_t scan_config = {};
@@ -727,7 +745,8 @@ static int scanForKnown() {
   esp_wifi_scan_get_ap_num(&ap_count);
   int nNets = staNetCount();
   if (ap_count == 0) {
-    info("0 Access Points found, none of our %d known networks in range\n", nNets);
+    if (nNets) info("0 Access Points found, none of our %d known networks in range\n", nNets);
+    else       info("0 Access Points found\n");
     return -1;
   }
   wifi_ap_record_t* ap_list = (wifi_ap_record_t*)gp_alloc(ap_count * sizeof(wifi_ap_record_t));
@@ -742,6 +761,27 @@ static int scanForKnown() {
     for (int j = 0; j < i && !dup; j++)
       dup = strcmp((const char*)ap_list[j].ssid, (const char*)ap_list[i].ssid) == 0;
     if (!dup) uniq++;
+  }
+  /* Announce each SSID we haven't named yet this boot, strongest first, at info
+   * so the environment is visible without debug logging and every scan can add
+   * networks that only just came into range. */
+  int* order = (int*)gp_alloc(ap_count * sizeof(int));
+  if (order) {
+    for (int i = 0; i < ap_count; i++) order[i] = i;
+    for (int i = 0; i < ap_count - 1; i++)
+      for (int j = i + 1; j < ap_count; j++)
+        if (ap_list[order[j]].rssi > ap_list[order[i]].rssi) {
+          int t = order[i]; order[i] = order[j]; order[j] = t;
+        }
+    for (int i = 0; i < ap_count; i++) {
+      const wifi_ap_record_t& ap = ap_list[order[i]];
+      if (!ap.ssid[0]) continue;  /* hidden network — nothing to name */
+      if (ssidAlreadyLogged((const char*)ap.ssid)) continue;  /* dups + prior scans */
+      markSsidLogged((const char*)ap.ssid);
+      info("scan found \"%s\" %ddBm%s\n", (const char*)ap.ssid, ap.rssi,
+           ap.authmode == WIFI_AUTH_OPEN ? " open" : "");
+    }
+    free(order);
   }
   int bestIdx = -1;
   char matched[33] = "";
@@ -760,9 +800,11 @@ found:
   if (bestIdx >= 0)
     info("%d different Access Points, %d unique SSIDs, found our known network '%s'\n",
          ap_count, uniq, matched);
-  else
+  else if (nNets)
     info("%d different Access Points, %d unique SSIDs, none of our %d known networks found\n",
          ap_count, uniq, nNets);
+  else
+    info("%d different Access Points, %d unique SSIDs\n", ap_count, uniq);
   return bestIdx;
 }
 
@@ -1288,13 +1330,13 @@ static void netTaskFn(void* arg) {
     storageSave();
     pmLockAcquire(netDeepLock);
     setDhcpHostname();
-    if (staNetCount() > 0) info("Bringing up STA mode to scan for wifi networks\n");
+    info("Bringing up STA mode to scan for wifi networks\n");
     wifiHwStart(WIFI_MODE_STA);
+    /* Scan even with no networks configured: the ST_SCANNING loop runs
+     * WIFI_SCANS_PER_CYCLE scans and then falls back to AP, and those scans
+     * publish the surrounding SSIDs (`scan found …`) that the flasher's connect
+     * helper offers the user. */
     state = ST_SCANNING;
-    if (staNetCount() == 0) {
-      if (startAP()) { state = ST_AP; doUp(state); }
-      else { state = ST_OFF; radioOff(); }
-    }
   }
 
   for (;;) {
