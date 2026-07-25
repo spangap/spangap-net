@@ -15,6 +15,7 @@
 #include "fs.h"
 #include "its.h"
 #include "tls.h"
+#include "auth.h"
 #include <lwip/sockets.h>
 #include <lwip/netdb.h>
 #include <fcntl.h>
@@ -2118,6 +2119,10 @@ void netInit() {
   cliRegisterCmd("net", netCliCmd);
   cliRegisterCmd("hostname", hostnameCliCmd);
   cliRegisterCmd("ping", pingCliCmd);
+
+  /* Surface a passwordless device once at boot so setup tooling (the flasher)
+   * can prompt for one. The admin realm ships unset until a password is chosen. */
+  if (authRealmUnset("admin")) info("No device password set\n");
   void wgetRegister();   /* wget.cpp — download CLI verb */
   wgetRegister();
 
