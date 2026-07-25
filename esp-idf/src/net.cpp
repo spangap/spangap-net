@@ -1042,7 +1042,12 @@ static bool connectSta(int idx) {
     esp_netif_get_dns_info(sta_netif, ESP_NETIF_DNS_MAIN, &dns_info);
     char dns_str[16];
     esp_ip4addr_ntoa(&dns_info.ip.u_addr.ip4, dns_str, sizeof(dns_str));
-    info("%s ip %s dns %s\n", ssid, ip_str, dns_str);
+    /* Report the configured hostname too (empty if unset): it is what
+     * <hostname>.local resolves to, so a browser flasher can address the device
+     * by its real name instead of guessing the default. */
+    char hostname[32];
+    storageGetStr("s.net.hostname", hostname, sizeof(hostname), "");
+    info("Connected \"%s\" ip %s dns %s host %s\n", ssid, ip_str, dns_str, hostname);
     /* Re-arm the one-shot inbound-TLS beacon so a reachability probe made right
      * after this connect gets logged with the client's source IP. */
     tlsArmConnLog();
@@ -1857,6 +1862,35 @@ static int parseArgs(const char* in, char* scratch, size_t scratchLen,
     }
 }
 
+/* `hostname` — show or set s.net.hostname. The new value is applied to the
+ * STA netif and mDNS the next time the station reconnects (e.g. `net join`,
+ * `net add`, or a reboot). */
+static void hostnameCliCmd(const char* args) {
+    if (cliWantsHelp(args)) {
+        cliPrintf("%-*s show or set the device hostname\n", CLI_HELP_COL, "hostname [<name>]");
+        return;
+    }
+    if (!*args) {
+        char host[32];
+        storageGetStr("s.net.hostname", host, sizeof(host), "");
+        cliPrintf("%s\n", host);
+        return;
+    }
+    char scratch[64]; char* argv[1];
+    int n = parseArgs(args, scratch, sizeof(scratch), argv, 1);
+    if (n == -1) { cliPrintf("bad quoting (use \"...\" for spaces)\n"); return; }
+    if (n == -2 || n != 1) { cliPrintf("usage: hostname [<name>]\n"); return; }
+    /* Hostnames are DNS/mDNS labels: letters, digits, underscore only. */
+    for (const char* p = argv[0]; *p; p++)
+        if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+              (*p >= '0' && *p <= '9') || *p == '_')) {
+            cliPrintf("invalid hostname '%s' — use letters, digits, and _ only\n", argv[0]);
+            return;
+        }
+    storageSet("s.net.hostname", argv[0]);
+    cliPrintf("hostname set to '%s' (applies on next reconnect)\n", argv[0]);
+}
+
 static void netCliCmd(const char* args) {
     if (strcmp(args, "help") == 0) { cliPrintf("%-*s WiFi status; list/up/down/add/join/delete\n", CLI_HELP_COL, "net [...]"); return; }
     if (cliWantsHelp(args)) {
@@ -2082,6 +2116,7 @@ void netInit() {
 
   pmLockCreate(PM_NO_DEEP_SLEEP, "net", &netDeepLock);
   cliRegisterCmd("net", netCliCmd);
+  cliRegisterCmd("hostname", hostnameCliCmd);
   cliRegisterCmd("ping", pingCliCmd);
   void wgetRegister();   /* wget.cpp — download CLI verb */
   wgetRegister();
