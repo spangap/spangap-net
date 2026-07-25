@@ -103,13 +103,18 @@ static constexpr uint16_t NET_PORT_TCP_DIAL = 2;
  *  each client. */
 typedef struct {
     uint16_t itsPort;     /* ITS port number (passed to onConnect) */
-    uint16_t tcpPort;     /* TCP listen port (0 = use nvsKey/defaultPort) */
+    uint16_t tcpPort;     /* listen port when ownPort=1 (0 = closed); else unused */
     uint8_t tls;          /* 1 = TLS termination on this port */
     uint8_t tcpNoDelay;   /* 1 = TCP_NODELAY (default 1) */
     uint8_t keepAlive;    /* 1 = SO_KEEPALIVE */
     uint8_t backlog;      /* listen backlog (0 = default 4) */
+    uint8_t ownPort;      /* 1 = registrant owns the port: net binds tcpPort
+                           *     directly (tcpPort 0 = close the socket) and
+                           *     never consults s.net.<nvsKey>. Re-send to change
+                           *     it — net rebinds/closes on its next poll.
+                           * 0 = config-driven: port is s.net.<nvsKey> or defaultPort. */
     char nvsKey[16];      /* local name; net looks up "s.net.<nvsKey>" (e.g. "rtsp_port") */
-    int  defaultPort;     /* default if config key missing */
+    int  defaultPort;     /* default if config key missing (config-driven only) */
 } net_port_msg_t;
 
 /* ---- ITS connect payload: net/web → task ---- */

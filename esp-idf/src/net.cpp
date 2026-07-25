@@ -152,6 +152,9 @@ struct net_endpoint_t {
     int port;         /* currently open port */
     char nvsKey[16];
     int defaultPort;
+    bool ownPort;     /* registrant manages the port: bind `port` directly (0 = closed),
+                       * never consult s.net.<nvsKey>. See net_port_msg_t.ownPort. */
+    int fixedPort;    /* desired port when ownPort — re-registration updates it */
     bool tls;
     bool tcpNoDelay;
     bool keepAlive;
@@ -193,7 +196,8 @@ static net_endpoint_t* epFindByKey(const char* nvsKey) {
  * — those tasks have no compile-time knowledge of TCP, so the dependency runs
  * net → core, never the reverse. */
 static void epRegister(TaskHandle_t task, uint16_t itsPort, const char* nvsKey,
-                       int defaultPort, bool tls, bool keepAlive, int backlog) {
+                       int defaultPort, bool ownPort, int fixedPort,
+                       bool tls, bool keepAlive, int backlog) {
     if (!task) return;
     net_endpoint_t* ep = epFindByKey(nvsKey);
     if (!ep) {
@@ -207,6 +211,11 @@ static void epRegister(TaskHandle_t task, uint16_t itsPort, const char* nvsKey,
     ep->itsPort = itsPort;
     safeStrncpy(ep->nvsKey, nvsKey, sizeof(ep->nvsKey));
     ep->defaultPort = defaultPort;
+    /* Re-registration with a new fixedPort is how an ownPort registrant changes
+     * or closes its listen socket at runtime: epOpenPort (run every poll by
+     * epOpenAll) sees the resolved port move and rebinds/closes. */
+    ep->ownPort = ownPort;
+    ep->fixedPort = fixedPort;
     ep->tls = tls;
     ep->tcpNoDelay = true;
     ep->keepAlive = keepAlive;
@@ -218,6 +227,7 @@ static void netOnAux(TaskHandle_t sender, const void* data, size_t len) {
     if (len < sizeof(net_port_msg_t)) return;
     auto* msg = (const net_port_msg_t*)data;
     epRegister(sender, msg->itsPort, msg->nvsKey, msg->defaultPort,
+               msg->ownPort != 0, msg->tcpPort,
                msg->tls, msg->keepAlive, msg->backlog);
 }
 
@@ -228,8 +238,10 @@ static void netOnAux(TaskHandle_t sender, const void* data, size_t len) {
  * s.net.cli_port / s.net.log_port. */
 static void netRegisterCorePorts() {
     epRegister(xTaskGetHandle("cli"), CLI_PORT_TCP, "cli_port", 0,
+               /*ownPort=*/false, /*fixedPort=*/0,
                /*tls=*/false, /*keepAlive=*/false, /*backlog=*/0);
     epRegister(xTaskGetHandle("log"), LOG_PORT_TCP, "log_port", 0,
+               /*ownPort=*/false, /*fixedPort=*/0,
                /*tls=*/false, /*keepAlive=*/false, /*backlog=*/0);
 }
 
@@ -250,7 +262,11 @@ static void netOnUpstreamUp(const char*) {
 static void epOpenPort(net_endpoint_t& ep) {
     char fullKey[32];
     snprintf(fullKey, sizeof(fullKey), "s.net.%s", ep.nvsKey);
-    int newPort = storageGetInt(fullKey, ep.defaultPort);
+    /* An ownPort registrant (e.g. the TCP inbound server, whose port lives in
+     * s.tcp.server_port, not s.net.*) binds fixedPort directly — 0 closes the
+     * socket, tracking the service's enabled state. Config-driven endpoints
+     * (cli/log/http/…) resolve via s.net.<nvsKey>. */
+    int newPort = ep.ownPort ? ep.fixedPort : storageGetInt(fullKey, ep.defaultPort);
     if (newPort == ep.port && (newPort <= 0 || ep.serverFd >= 0)) return;
     if (ep.serverFd >= 0) {
         info("closing port %d (%s)\n", ep.port, ep.nvsKey);
