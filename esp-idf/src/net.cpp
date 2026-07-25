@@ -1001,6 +1001,9 @@ static bool connectSta(int idx) {
     char dns_str[16];
     esp_ip4addr_ntoa(&dns_info.ip.u_addr.ip4, dns_str, sizeof(dns_str));
     info("%s ip %s dns %s\n", ssid, ip_str, dns_str);
+    /* Re-arm the one-shot inbound-TLS beacon so a reachability probe made right
+     * after this connect gets logged with the client's source IP. */
+    tlsArmConnLog();
     return true;
   }
   info("%s connect failed\n", ssid);

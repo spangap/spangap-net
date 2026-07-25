@@ -367,6 +367,13 @@ static volatile bool handshakeInProgress = false;
 
 bool tlsReady() { return ready && !handshakeInProgress; }
 
+/* Inbound-TLS beacon: once armed (on WiFi connect), log EVERY inbound TLS
+ * connection's peer IP + local port. Not one-shot — a reachability probe may
+ * retry, and other clients can connect in between, so each connection must be
+ * observable (see tls.h). */
+static volatile bool connLogArmed = false;
+void tlsArmConnLog() { connLogArmed = true; }
+
 tls_conn_t* tlsAccept(int serverFd) {
     if (!ready || serverFd < 0) return nullptr;
 
@@ -381,6 +388,19 @@ tls_conn_t* tlsAccept(int serverFd) {
     socklen_t len = sizeof(addr);
     int fd = accept(serverFd, (struct sockaddr*)&addr, &len);
     if (fd < 0) return nullptr;
+    /* Log at accept time — before the handshake, so it fires even when the client
+     * rejects our self-signed cert. The peer IP is what the device sees as the
+     * client's source address. */
+    if (connLogArmed) {
+        uint32_t ip = ntohl(addr.sin_addr.s_addr);
+        struct sockaddr_in local = {};
+        socklen_t llen = sizeof(local);
+        getsockname(fd, (struct sockaddr*)&local, &llen);
+        info("inbound TLS from %u.%u.%u.%u to :%u\n",
+             (unsigned)((ip >> 24) & 0xff), (unsigned)((ip >> 16) & 0xff),
+             (unsigned)((ip >> 8) & 0xff), (unsigned)(ip & 0xff),
+             (unsigned)ntohs(local.sin_port));
+    }
     handshakeInProgress = true;
 
     /* TCP_NODELAY for TLS handshake performance */

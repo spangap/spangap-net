@@ -37,6 +37,14 @@ tls_conn_t* tlsAccept(int serverFd);
 /** Get the raw fd from a TLS connection (for select/poll). */
 int tlsFd(tls_conn_t* conn);
 
+/** Arm logging of inbound TLS connections' peer IP and local port. Once armed,
+ *  EVERY accepted connection is logged (in tlsAccept, at TCP-accept time, before
+ *  the handshake — so it captures a client that later rejects the self-signed
+ *  cert). Not one-shot: a reachability probe may retry and other clients may
+ *  connect in between, so each connection must be observable. Called on each
+ *  WiFi connect; nothing disarms it. */
+void tlsArmConnLog();
+
 /** Read up to len bytes.  Returns bytes read, 0 on timeout/EAGAIN, -1 on error/close. */
 int tlsRead(tls_conn_t* conn, void* buf, size_t len);
 
