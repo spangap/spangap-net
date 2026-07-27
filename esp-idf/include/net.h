@@ -77,6 +77,25 @@ void netActivity();
 void netTrafficIn(uint32_t bytes);
 void netTrafficOut(uint32_t bytes);
 
+/* Wi-Fi traffic ring for the activity monitor — per-second byte/packet deltas
+ * on the STA interface, from lwIP MIB2 counters. Filled by a 1 Hz sampler that
+ * piggy-backs on the CPU sampler, so only while a UI consumer (-web/-lcd) is
+ * present. Byte/packet rates can exceed 65 k/s, so the fields are 32-bit. */
+struct NetTrafSample { uint32_t bytesIn, bytesOut, pktsIn, pktsOut; };
+
+/** Copy up to `max` most-recent traffic samples into out[], oldest first.
+ *  Returns the count (0 if the ring isn't up yet). Thread-safe. */
+int netTrafficHistory(NetTrafSample* out, int max);
+
+/** Estimated average Wi-Fi current draw (tenths of a mA) over the last `secs`
+ *  traffic samples — a rough throughput→power model to be calibrated against a
+ *  real measurement. secs<=0 → 300. Thread-safe. */
+int netTrafficAvgMa10(int secs);
+
+/** Register the traffic sampler on the shared CPU-sampler cadence. Call from
+ *  netInit; the ring allocates lazily on the first sampled second. */
+void netTrafficInit(void);
+
 /** Get the local STA IP address. Returns "" if not connected. */
 void netGetLocalIp(char* out, size_t len);
 

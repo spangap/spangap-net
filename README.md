@@ -67,6 +67,13 @@ straddles read them and register listeners, but the keys live here: `http_port`
 off-by-default `log_port` / `cli_port`. See [docs/net.md](docs/net.md) for the
 full storage surface.
 
+A registrant can instead own its port itself (`ownPort` in `net_port_msg_t`):
+net binds the port it passes directly and never consults `s.net.*`, and a
+passed port of 0 closes the listener. This is for services whose port lives in
+their own config tree rather than net's — the TCP inbound server binds
+`s.tcp.server_port` and opens/closes as it's enabled/disabled. See
+[docs/net-internals.md](docs/net-internals.md).
+
 ## What it does NOT own
 
 - HTTPS server / REST / WebDAV / WebSocket — [spangap-web](../spangap-web)

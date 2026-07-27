@@ -226,7 +226,7 @@ static void cmdDateWait(const char* a) {
       info("date wait: timed out after %ds\n", timeout);
       break;
     }
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    delay(1000);
   }
   if (timeValid()) {
     info("valid date received\n");

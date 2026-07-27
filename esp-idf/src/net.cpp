@@ -22,8 +22,11 @@
 #include "esp_wifi.h"
 #include "esp_sleep.h"
 #include "esp_netif.h"
+#include "esp_netif_net_stack.h"   /* esp_netif_get_netif_impl → lwIP struct netif */
 #include "esp_event.h"
 #include "lwip/ip4_addr.h"
+#include "lwip/netif.h"            /* struct netif + input/linkoutput fn pointers */
+#include <freertos/semphr.h>
 #include <cstring>
 #include <cstdio>
 #include <string>
@@ -2076,7 +2079,218 @@ static void netCliCmd(const char* args) {
  * v2: ap.disable folded into ap.active_for (-1 = disabled). */
 #define NET_VERSION 2
 
+/* ================= Wi-Fi traffic ring (activity monitor) ================= */
+
+static NetTrafSample*    s_trafRing = nullptr;
+static int               s_trafCap = 0, s_trafHead = 0, s_trafCount = 0;
+static SemaphoreHandle_t s_trafMux = nullptr;
+static bool              s_trafPrimed = false;
+static uint32_t          s_prevBIn = 0, s_prevBOut = 0, s_prevPIn = 0, s_prevPOut = 0;
+
+/* Per-window Wi-Fi averages for the web pill (tx/rx utilisation ×10 %, current
+ * ×10 mA). Windows match pm.cpp's AVG_WINDOWS. */
+static const int NET_WINDOWS[] = { 30, 60, 120, 180, 240, 300 };
+static constexpr int N_NET_WINDOWS = (int)(sizeof(NET_WINDOWS) / sizeof(NET_WINDOWS[0]));
+struct NetAvg { int txPctX10, rxPctX10, mA10; };
+static void netTrafficAvgSet(NetAvg* out);   /* one-pass multi-window; defined below */
+
+/* esp_netif's Wi-Fi RX path calls netif->input directly, bypassing lwIP's MIB2
+ * netif accounting — so we tally frames ourselves by wrapping the STA netif's
+ * input + linkoutput function pointers and chaining to the originals. ABI-safe
+ * (no struct change) and re-armed each second in case the netif is recreated on
+ * reconnect. Volatile counters: written on the tcpip/output threads, read by the
+ * sampler — a torn read only skews one second's rate harmlessly. */
+static volatile uint32_t   s_rxB = 0, s_rxP = 0, s_txB = 0, s_txP = 0;
+static netif_input_fn      s_origInput   = nullptr;
+static netif_linkoutput_fn s_origLinkout = nullptr;
+
+static err_t trafInputHook(struct pbuf* p, struct netif* inp) {
+  if (p) { s_rxB = s_rxB + p->tot_len; s_rxP = s_rxP + 1; }
+  return s_origInput ? s_origInput(p, inp) : (err_t)ERR_IF;
+}
+static err_t trafLinkoutHook(struct netif* nif, struct pbuf* p) {
+  if (p) { s_txB = s_txB + p->tot_len; s_txP = s_txP + 1; }
+  return s_origLinkout ? s_origLinkout(nif, p) : (err_t)ERR_IF;
+}
+static void trafArmHooks(void) {
+  if (!sta_netif) return;
+  struct netif* n = (struct netif*)esp_netif_get_netif_impl(sta_netif);
+  if (!n) return;
+  if (n->input != trafInputHook)          { s_origInput   = n->input;      n->input      = trafInputHook; }
+  if (n->linkoutput != trafLinkoutHook)   { s_origLinkout = n->linkoutput; n->linkoutput = trafLinkoutHook; }
+}
+
+/* nethist: an ITS server that hands a browser the whole traffic ring in one shot
+ * on connect, then disconnects — the wifi-graph counterpart of cpuhist, so a
+ * freshly-opened web monitor pre-fills instead of accumulating a sample a second.
+ * Browser opens a DataChannel labelled "nethist:1". */
+static constexpr uint16_t NETHIST_PORT = 1;
+static int  s_netHistClient  = -1;
+static bool s_netHistStarted = false;
+
+static int netHistOnConnect(int handle, const void*, size_t) { s_netHistClient = handle; return 0; }
+
+static void netHistTask(void*) {
+  itsServerInit();
+  itsServerPortOpen(NETHIST_PORT, ITS_PACKET, 1, 0, 8192, 0, 8192);
+  itsServerOnConnect(NETHIST_PORT, netHistOnConnect);
+  for (;;) {
+    itsPoll(pdMS_TO_TICKS(500));
+    while (itsPoll(0)) {}
+    if (s_netHistClient >= 0) {
+      int h = s_netHistClient; s_netHistClient = -1;
+      const int MAX = 320;                        /* one screen-width of samples */
+      auto* tmp = (NetTrafSample*)gp_alloc((size_t)MAX * sizeof(NetTrafSample));
+      if (tmp) {
+        int n = netTrafficHistory(tmp, MAX);
+        itsSend(h, tmp, (size_t)n * sizeof(NetTrafSample), pdMS_TO_TICKS(1000));
+        free(tmp);
+      }
+      itsDisconnect(h);                           /* one-shot: blob then close */
+    }
+  }
+}
+
+/* One per-second sample: diff the cumulative counters, push the delta, and — if
+ * a monitor is watching — publish the latest second. Runs on the CPU sampler's
+ * beat (core 0). Unsigned subtraction is wrap-safe. */
+static void netTrafficTick(void) {
+  if (!s_trafMux) s_trafMux = xSemaphoreCreateMutex();   /* persists across restarts */
+  if (!s_trafRing) {                             /* fresh zeroed ring each time watching resumes */
+    int cap = storageGetInt("s.sys.cpu_sample_buf", 320);
+    if (cap < 1) cap = 1;
+    if (cap > 3600) cap = 3600;
+    s_trafRing = (NetTrafSample*)gp_alloc((size_t)cap * sizeof(NetTrafSample));
+    if (s_trafRing) memset(s_trafRing, 0, (size_t)cap * sizeof(NetTrafSample));
+    s_trafCap  = s_trafRing ? cap : 0;
+    s_trafHead = 0; s_trafCount = 0;
+  }
+  if (!s_netHistStarted) {                        /* start the blob server once a UI is present */
+    s_netHistStarted = true;
+    spawnTask(netHistTask, "nethist", 4096, nullptr, 1, 0, STACK_PSRAM);
+  }
+
+  trafArmHooks();                                /* (re)install on the live netif */
+  NetTrafSample d = { 0, 0, 0, 0 };
+  uint32_t bIn = s_rxB, bOut = s_txB, pIn = s_rxP, pOut = s_txP;
+  if (s_trafPrimed) {
+    d.bytesIn  = bIn  - s_prevBIn;
+    d.bytesOut = bOut - s_prevBOut;
+    d.pktsIn   = pIn  - s_prevPIn;
+    d.pktsOut  = pOut - s_prevPOut;
+  }
+  s_prevBIn = bIn; s_prevBOut = bOut; s_prevPIn = pIn; s_prevPOut = pOut;
+  s_trafPrimed = true;
+
+  if (s_trafRing && s_trafCap > 0 && s_trafMux) {
+    xSemaphoreTake(s_trafMux, portMAX_DELAY);
+    s_trafRing[s_trafHead] = d;
+    s_trafHead = (s_trafHead + 1) % s_trafCap;
+    if (s_trafCount < s_trafCap) s_trafCount++;
+    xSemaphoreGive(s_trafMux);
+  }
+
+  if (storageGetInt("sys.stats.web_actmon", 0) || storageGetInt("sys.stats.lcd_actmon", 0)) {
+    storageBegin();
+    storageSet("sys.stats.net.bytes_in",  (int)d.bytesIn);
+    storageSet("sys.stats.net.bytes_out", (int)d.bytesOut);
+    storageSet("sys.stats.net.pkts_in",   (int)d.pktsIn);
+    storageSet("sys.stats.net.pkts_out",  (int)d.pktsOut);
+    /* Per-window Wi-Fi averages for the draggable pill:
+       sys.stats.avg.net.w<secs>.{tx_x10,rx_x10,ma_x10}. */
+    NetAvg na[N_NET_WINDOWS];
+    netTrafficAvgSet(na);
+    for (int i = 0; i < N_NET_WINDOWS; i++) {
+      char key[52]; int w = NET_WINDOWS[i];
+      snprintf(key, sizeof key, "sys.stats.avg.net.w%d.tx_x10", w); storageSet(key, na[i].txPctX10);
+      snprintf(key, sizeof key, "sys.stats.avg.net.w%d.rx_x10", w); storageSet(key, na[i].rxPctX10);
+      snprintf(key, sizeof key, "sys.stats.avg.net.w%d.ma_x10", w); storageSet(key, na[i].mA10);
+    }
+    storageEnd();
+  }
+}
+
+int netTrafficHistory(NetTrafSample* out, int max) {
+  if (!out || max <= 0 || !s_trafMux || !s_trafRing || s_trafCap <= 0) return 0;
+  xSemaphoreTake(s_trafMux, portMAX_DELAY);
+  int n = s_trafCount < max ? s_trafCount : max;
+  int start = ((s_trafHead - n) % s_trafCap + s_trafCap) % s_trafCap;
+  for (int i = 0; i < n; i++) out[i] = s_trafRing[(start + i) % s_trafCap];
+  xSemaphoreGive(s_trafMux);
+  return n;
+}
+
+/* Placeholder Wi-Fi power model — tune against a real measurement. A radio idle
+ * floor plus a linear term in average throughput. */
+static const int WIFI_IDLE_MA10     = 20;      /* ~2.0 mA radio idle / DTIM wake */
+static const int WIFI_MA10_PER_MBIT = 30;      /* ~3.0 mA per Mbit/s of throughput */
+
+int netTrafficAvgMa10(int secs) {
+  if (secs <= 0) secs = 300;
+  uint64_t sumBytes = 0;
+  int n = 0;
+  if (s_trafMux && s_trafRing && s_trafCap > 0) {
+    xSemaphoreTake(s_trafMux, portMAX_DELAY);
+    n = s_trafCount < secs ? s_trafCount : secs;
+    int start = ((s_trafHead - n) % s_trafCap + s_trafCap) % s_trafCap;
+    for (int i = 0; i < n; i++) {
+      const NetTrafSample& e = s_trafRing[(start + i) % s_trafCap];
+      sumBytes += (uint64_t)e.bytesIn + e.bytesOut;
+    }
+    xSemaphoreGive(s_trafMux);
+  }
+  if (n <= 0) return WIFI_IDLE_MA10;
+  uint64_t avgBps = sumBytes / (uint32_t)n;                        /* avg total bytes/s */
+  int64_t ma10 = WIFI_IDLE_MA10 + (int64_t)(avgBps * 8 * WIFI_MA10_PER_MBIT) / 1000000;
+  return (int)ma10;
+}
+
+/* Utilisation is throughput as a fraction of a nominal link capacity — placeholder,
+ * to be calibrated. tx = transmitted, rx = received. */
+static const uint32_t WIFI_NOMINAL_BPS = 2000000;   /* 2 MB/s ≈ 100% (placeholder) */
+
+static void netAvgFromSums(NetAvg* o, uint64_t txSum, uint64_t rxSum, int n) {
+  if (n <= 0) { o->txPctX10 = o->rxPctX10 = 0; o->mA10 = WIFI_IDLE_MA10; return; }
+  uint32_t txBps = (uint32_t)(txSum / (uint32_t)n), rxBps = (uint32_t)(rxSum / (uint32_t)n);
+  o->txPctX10 = (int)((uint64_t)txBps * 1000 / WIFI_NOMINAL_BPS);   /* tenths of a percent */
+  o->rxPctX10 = (int)((uint64_t)rxBps * 1000 / WIFI_NOMINAL_BPS);
+  uint64_t tot = (uint64_t)txBps + rxBps;
+  o->mA10 = WIFI_IDLE_MA10 + (int)((tot * 8 * WIFI_MA10_PER_MBIT) / 1000000);
+}
+
+/* All NET_WINDOWS in one backward pass (nested, like pmStatsAvgSet). */
+static void netTrafficAvgSet(NetAvg* out) {
+  for (int i = 0; i < N_NET_WINDOWS; i++) netAvgFromSums(&out[i], 0, 0, 0);
+  uint64_t txSum = 0, rxSum = 0;
+  int cnt = 0, wi = 0;
+  if (s_trafMux && s_trafRing && s_trafCap > 0) {
+    xSemaphoreTake(s_trafMux, portMAX_DELAY);
+    int total = s_trafCount < NET_WINDOWS[N_NET_WINDOWS - 1] ? s_trafCount : NET_WINDOWS[N_NET_WINDOWS - 1];
+    for (int k = 0; k < total; k++) {
+      int idx = ((s_trafHead - 1 - k) % s_trafCap + s_trafCap) % s_trafCap;
+      const NetTrafSample& e = s_trafRing[idx];
+      txSum += e.bytesOut; rxSum += e.bytesIn; cnt++;
+      while (wi < N_NET_WINDOWS && cnt == NET_WINDOWS[wi]) { netAvgFromSums(&out[wi], txSum, rxSum, cnt); wi++; }
+    }
+    xSemaphoreGive(s_trafMux);
+  }
+  for (; wi < N_NET_WINDOWS; wi++) netAvgFromSums(&out[wi], txSum, rxSum, cnt);
+}
+
+/* Freed when the last Activity monitor stops watching (the shared sampler is
+   tearing down). The mutex persists; drop the ring and re-prime so a later
+   resume reallocates fresh and its first delta isn't a giant stale jump. */
+static void netTrafficStop(void) {
+  if (s_trafMux) xSemaphoreTake(s_trafMux, portMAX_DELAY);
+  free(s_trafRing); s_trafRing = nullptr; s_trafCap = 0; s_trafHead = 0; s_trafCount = 0;
+  if (s_trafMux) xSemaphoreGive(s_trafMux);
+  s_trafPrimed = false;
+}
+
+void netTrafficInit(void) { pmStatsAddSampler(netTrafficTick, nullptr, netTrafficStop); }
+
 void netInit() {
+  netTrafficInit();
   int v = storageGetInt("s.net.version", 0);
   if (v < NET_VERSION) {
     /* hostname and AP SSID interpolate CONFIG_SPANGAP_FW_HOSTNAME (the

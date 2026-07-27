@@ -99,10 +99,21 @@ fds, then:
 net → core, never the reverse. Their port keys (`s.net.cli_port` /
 `s.net.log_port`) default to 0.
 
-`epOpenPort()` reads `s.net.<nvsKey>` live; the `s.net.` change subscription
-calls `epOpenAll()` so editing a port key re-binds the socket without a reboot.
-A service that wants a port simply ships `nvsKey` + `defaultPort` in its
-`net_port_msg_t` — net owns the `s.net.*` key, the service owns the listener.
+An endpoint resolves its listen port one of two ways, chosen by `ownPort` in
+its `net_port_msg_t`:
+
+- **Config-driven** (`ownPort=0`, the default): `epOpenPort()` reads
+  `s.net.<nvsKey>` live, falling back to `defaultPort`. The `s.net.` change
+  subscription calls `epOpenAll()`, so editing a port key re-binds without a
+  reboot. Net owns the `s.net.*` key; the service owns the listener. `cli`,
+  `log`, `http`, `https`, `rtsp` all work this way.
+- **Registrant-owned** (`ownPort=1`): net binds `tcpPort` directly and never
+  touches `s.net.*` — for a service whose port lives in its own config tree
+  (the TCP inbound server's port is `s.tcp.server_port`, not `s.net.*`).
+  `tcpPort=0` means **close the socket**, so the registrant opens and closes its
+  listener by re-registering as the service is enabled/disabled. `epOpenAll()`
+  runs every poll, so a re-registration with a changed (or zeroed) `tcpPort`
+  rebinds or closes on the next pass — no reboot, no config key.
 
 **Outbound dial** (`netOnDialConnect`) runs `netDialSync` on the net task:
 `getaddrinfo` with `AF_UNSPEC`, then a bounded non-blocking connect over each
