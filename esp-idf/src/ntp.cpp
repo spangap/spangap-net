@@ -5,6 +5,7 @@
  * Browser can push epoch seconds via sys.time.set when NTP is unavailable.
  */
 #include "ntp.h"
+#include "spangap.h"
 #include "mem.h"
 #include "storage.h"
 #include "fs.h"
@@ -34,6 +35,8 @@ static void updateTimeValid() {
   bool valid = timeValid();
   storageBegin();
   storageSet("sys.time.valid", valid ? 1 : 0);
+  /* Wake any boot task blocked in waitForTime() the instant the clock lands. */
+  if (valid) signalTimeValid();
   /* Publish the wall-clock instant this device booted, so consumers can turn a
    * monotonic (since-boot) timestamp into real Unix time:
    *     unix_of_event = sys.boot_time + monotonic_seconds_of_event

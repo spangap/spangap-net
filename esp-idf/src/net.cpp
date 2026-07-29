@@ -6,6 +6,7 @@
  * Events: modules register callbacks via netRegister() for UP/DOWN/CFG/POLL.
  */
 #include "net.h"
+#include "spangap.h"
 #include "mem.h"
 #include "storage.h"
 #include "compat.h"
@@ -844,6 +845,7 @@ static void setUpstream(bool up) {
    * configured — see net.want). Decoupled by storage key so rns has no net
    * dependency and net-less builds simply never set it. */
   storageSet("net.up", up ? 1 : 0);
+  if (up) signalFlag("net.up");   /* wake the rns boot barrier blocked in waitForFlag */
   fireEvent(up ? NET_EV_UPSTREAM_UP : NET_EV_UPSTREAM_DOWN);
 }
 
