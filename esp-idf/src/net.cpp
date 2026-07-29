@@ -2125,10 +2125,11 @@ static void trafArmHooks(void) {
 /* nethist: an ITS server that hands a browser the whole traffic ring in one shot
  * on connect, then disconnects — the wifi-graph counterpart of cpuhist, so a
  * freshly-opened web monitor pre-fills instead of accumulating a sample a second.
- * Browser opens a DataChannel labelled "nethist:1". */
+ * Browser opens a DataChannel labelled "nethist:1". Spawned on demand by that
+ * connect (see itsRegisterOnDemand in netTrafficInit) and gone once the blob is
+ * out, so it holds a TCB only while it's actually serving. */
 static constexpr uint16_t NETHIST_PORT = 1;
 static int  s_netHistClient  = -1;
-static bool s_netHistStarted = false;
 
 static int netHistOnConnect(int handle, const void*, size_t) { s_netHistClient = handle; return 0; }
 
@@ -2136,21 +2137,22 @@ static void netHistTask(void*) {
   itsServerInit();
   itsServerPortOpen(NETHIST_PORT, ITS_PACKET, 1, 0, 8192, 0, 8192);
   itsServerOnConnect(NETHIST_PORT, netHistOnConnect);
-  for (;;) {
-    itsPoll(pdMS_TO_TICKS(500));
-    while (itsPoll(0)) {}
-    if (s_netHistClient >= 0) {
-      int h = s_netHistClient; s_netHistClient = -1;
-      const int MAX = 320;                        /* one screen-width of samples */
-      auto* tmp = (NetTrafSample*)gp_alloc((size_t)MAX * sizeof(NetTrafSample));
-      if (tmp) {
-        int n = netTrafficHistory(tmp, MAX);
-        itsSend(h, tmp, (size_t)n * sizeof(NetTrafSample), pdMS_TO_TICKS(1000));
-        free(tmp);
-      }
-      itsDisconnect(h);                           /* one-shot: blob then close */
+  /* The itsConnect that spawned us is already handshaking; poll long enough to
+     accept it (its side has a 3 s connect budget), hand over the ring, exit. */
+  itsPoll(pdMS_TO_TICKS(3000));
+  while (itsPoll(0)) {}
+  if (s_netHistClient >= 0) {
+    int h = s_netHistClient; s_netHistClient = -1;
+    const int MAX = 320;                          /* one screen-width of samples */
+    auto* tmp = (NetTrafSample*)gp_alloc((size_t)MAX * sizeof(NetTrafSample));
+    if (tmp) {
+      int n = netTrafficHistory(tmp, MAX);
+      if (n > 0) itsSend(h, tmp, (size_t)n * sizeof(NetTrafSample), pdMS_TO_TICKS(1000));
+      free(tmp);                                  /* n == 0 (no traffic sampled yet): nothing to send */
     }
+    itsDisconnect(h);                             /* one-shot: blob then close */
   }
+  killSelf();
 }
 
 /* One per-second sample: diff the cumulative counters, push the delta, and — if
@@ -2167,11 +2169,6 @@ static void netTrafficTick(void) {
     s_trafCap  = s_trafRing ? cap : 0;
     s_trafHead = 0; s_trafCount = 0;
   }
-  if (!s_netHistStarted) {                        /* start the blob server once a UI is present */
-    s_netHistStarted = true;
-    spawnTask(netHistTask, "nethist", 4096, nullptr, 1, 0, STACK_PSRAM);
-  }
-
   trafArmHooks();                                /* (re)install on the live netif */
   NetTrafSample d = { 0, 0, 0, 0 };
   uint32_t bIn = s_rxB, bOut = s_txB, pIn = s_rxP, pOut = s_txP;
@@ -2289,7 +2286,12 @@ static void netTrafficStop(void) {
   s_trafPrimed = false;
 }
 
-void netTrafficInit(void) { pmStatsAddSampler(netTrafficTick, nullptr, netTrafficStop); }
+void netTrafficInit(void) {
+  itsRegisterOnDemand("nethist", [] {
+    spawnTask(netHistTask, "nethist", 4096, nullptr, 1, 0, STACK_PSRAM);
+  });
+  pmStatsAddSampler(netTrafficTick, nullptr, netTrafficStop);
+}
 
 void netInit() {
   netTrafficInit();
