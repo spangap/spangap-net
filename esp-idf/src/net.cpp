@@ -739,22 +739,58 @@ static void staNetDeleteIdx(int idx) {
   storageEnd();
 }
 
-/* SSIDs already announced via `scan found` this boot. Each network is named at
- * info exactly once, but across ALL scans — a network that only shows up in a
- * later scan still gets named, so the full environment (and the flasher's
- * connect-helper list) accumulates. Reset only by a real reboot. */
-#define SCAN_LOG_MAX 64
-static char loggedSsids[SCAN_LOG_MAX][33];
-static int  loggedSsidCount = 0;
+/* Access points seen this boot, one record per SSID. The cache accumulates
+ * across ALL scans — a network that only shows up in a later scan still lands
+ * here, so the environment fills in over time rather than being whatever the
+ * most recent single scan happened to see. Reset only by a real reboot.
+ *
+ * `named` carries the other half: each network is announced at info via
+ * `scan found` exactly once, so the log names every network it ever sees
+ * without repeating itself every scan cycle.
+ *
+ * `net scan` prints this cache; it starts no scan of its own. */
+#define SCAN_CACHE_MAX 64
+struct scan_seen_t {
+  char   ssid[33];
+  int8_t rssi;      /* loudest this network has been, not the latest */
+  bool   open;
+  bool   named;     /* `scan found` already logged for it this boot */
+};
+static scan_seen_t scanSeen[SCAN_CACHE_MAX];
+/* Volatile because it publishes: the net task appends records and `net scan`
+ * reads them from the CLI task. An entry is filled in completely before the
+ * count that exposes it is raised, so a reader never sees a half-written SSID.
+ * Nothing stronger is needed — the only other cross-task write is an int8 RSSI
+ * on an entry that is already published, where a stale read costs a dBm. */
+static volatile int scanSeenCount = 0;
 
-static bool ssidAlreadyLogged(const char* ssid) {
-  for (int i = 0; i < loggedSsidCount; i++)
-    if (strcmp(loggedSsids[i], ssid) == 0) return true;
-  return false;
+static scan_seen_t* scanSeenFind(const char* ssid) {
+  for (int i = 0; i < scanSeenCount; i++)
+    if (strcmp(scanSeen[i].ssid, ssid) == 0) return &scanSeen[i];
+  return nullptr;
 }
-static void markSsidLogged(const char* ssid) {
-  if (loggedSsidCount < SCAN_LOG_MAX)
-    safeStrncpy(loggedSsids[loggedSsidCount++], ssid, sizeof(loggedSsids[0]));
+
+/* Record one sighting; nullptr only when the cache is full. The RSSI/open
+ * update runs on every sighting — ahead of the `named` check, which skips
+ * repeats outright — so a network that is louder in a later scan is remembered
+ * at its best rather than at whatever the first scan happened to hear. */
+static scan_seen_t* scanSeenNote(const char* ssid, int8_t rssi, bool open) {
+  scan_seen_t* s = scanSeenFind(ssid);
+  if (s) {
+    if (rssi > s->rssi) s->rssi = rssi;
+    s->open = open;
+    return s;
+  }
+  if (scanSeenCount >= SCAN_CACHE_MAX) return nullptr;
+  s = &scanSeen[scanSeenCount];
+  safeStrncpy(s->ssid, ssid, sizeof(s->ssid));
+  s->rssi  = rssi;
+  s->open  = open;
+  s->named = false;
+  /* Last: the record is complete before it becomes visible. Spelled out rather
+   * than `++` — that form is deprecated on a volatile. */
+  scanSeenCount = scanSeenCount + 1;
+  return s;
 }
 
 static int scanForKnown() {
@@ -797,10 +833,11 @@ static int scanForKnown() {
     for (int i = 0; i < ap_count; i++) {
       const wifi_ap_record_t& ap = ap_list[order[i]];
       if (!ap.ssid[0]) continue;  /* hidden network — nothing to name */
-      if (ssidAlreadyLogged((const char*)ap.ssid)) continue;  /* dups + prior scans */
-      markSsidLogged((const char*)ap.ssid);
-      info("scan found \"%s\" %ddBm%s\n", (const char*)ap.ssid, ap.rssi,
-           ap.authmode == WIFI_AUTH_OPEN ? " open" : "");
+      scan_seen_t* s = scanSeenNote((const char*)ap.ssid, ap.rssi,
+                                    ap.authmode == WIFI_AUTH_OPEN);
+      if (!s || s->named) continue;  /* cache full, or dups + prior scans */
+      s->named = true;
+      info("scan found \"%s\" %ddBm%s\n", s->ssid, s->rssi, s->open ? " open" : "");
     }
     free(order);
   }
@@ -1361,8 +1398,9 @@ static void netTaskFn(void* arg) {
     wifiHwStart(WIFI_MODE_STA);
     /* Scan even with no networks configured: the ST_SCANNING loop runs
      * WIFI_SCANS_PER_CYCLE scans and then falls back to AP, and those scans
-     * publish the surrounding SSIDs (`scan found …`) that the flasher's connect
-     * helper offers the user. */
+     * fill the cache `net scan` reports — which is how setup tooling gets a
+     * list of surrounding networks to offer the user without asking for a scan
+     * of its own. */
     state = ST_SCANNING;
   }
 
@@ -1914,15 +1952,86 @@ static void hostnameCliCmd(const char* args) {
 }
 
 static void netCliCmd(const char* args) {
-    if (strcmp(args, "help") == 0) { cliPrintf("%-*s WiFi status; list/up/down/add/join/delete\n", CLI_HELP_COL, "net [...]"); return; }
+    if (strcmp(args, "help") == 0) { cliPrintf("%-*s WiFi status; list/scan/up/down/add/join/delete\n", CLI_HELP_COL, "net [...]"); return; }
     if (cliWantsHelp(args)) {
         cliPrintf("%-*s WiFi control / status\n", CLI_HELP_COL, "net [up|down|down!]");
         cliPrintf("%-*s list stored WiFi networks\n", CLI_HELP_COL, "net list");
         cliPrintf("%-*s save a WiFi network (quote spaces)\n", CLI_HELP_COL, "net add <ssid> [pass]");
         cliPrintf("%-*s force-join a known network\n", CLI_HELP_COL, "net join <ssid>");
         cliPrintf("%-*s remove + disconnect\n",     CLI_HELP_COL, "net delete <ssid>");
+        cliPrintf("%-*s access points seen this boot, loudest first\n", CLI_HELP_COL, "net scan");
+        cliPrintf("%-*s onboarding output: state/ssid/ip/hostname\n", CLI_HELP_COL, "net -O");
+        cliPrintf("%-*s onboarding output: count + one ap= per network\n", CLI_HELP_COL, "net scan -O");
         return;
     }
+
+    /* Onboarding output — the machine-readable contract, `key=value` lines and
+     * nothing else. A flasher reads these to drive provisioning; the human
+     * status display below is free to change without breaking it. */
+    if (strcmp(args, "-O") == 0) {
+        cliPrintf("state=%s\n", wifiState == ST_SCANNING      ? "connecting"
+                              : wifiState == ST_AP            ? "ap"
+                              : wifiState == ST_STA_CONNECTED ? "sta"
+                                                              : "down");
+        char ssid[33] = "", ip[16] = "";
+        esp_netif_ip_info_t ip_info = {};
+        if (wifiState == ST_AP) {
+            storageGetStr("s.net.wifi.ap.ssid", ssid, sizeof(ssid), WIFI_AP_SSID);
+            if (ap_netif) esp_netif_get_ip_info(ap_netif, &ip_info);
+        } else if (wifiState == ST_STA_CONNECTED) {
+            wifi_ap_record_t ap_info;
+            if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK)
+                safeStrncpy(ssid, (const char*)ap_info.ssid, sizeof(ssid));
+            if (sta_netif) esp_netif_get_ip_info(sta_netif, &ip_info);
+        }
+        esp_ip4addr_ntoa(&ip_info.ip, ip, sizeof(ip));
+        /* A key that isn't known is omitted, not emitted empty — the reader
+         * treats missing and unknown as the same thing either way. */
+        if (ssid[0]) cliPrintf("ssid=%s\n", ssid);
+        if (ip[0] && strcmp(ip, "0.0.0.0") != 0) cliPrintf("ip=%s\n", ip);
+        char host[48];
+        storageGetStr("s.net.hostname", host, sizeof(host), "");
+        if (host[0]) cliPrintf("hostname=%s\n", host);
+        return;
+    }
+
+    if (strcmp(args, "scan") == 0 || strcmp(args, "scan -O") == 0) {
+        const bool onboarding = (args[4] != '\0');
+        int order[SCAN_CACHE_MAX];
+        int n = 0;
+        for (int i = 0; i < scanSeenCount; i++) {
+            /* An SSID that isn't representable on one line would corrupt a
+             * key=value stream, so it is skipped rather than emitted — and
+             * `count` is computed after this filter, so it always equals the
+             * number of `ap=` lines that follow. */
+            if (onboarding && strpbrk(scanSeen[i].ssid, "\r\n")) continue;
+            order[n++] = i;
+        }
+        /* Sorting <= 64 entries at print time is free, and keeps the cache in
+         * sighting order so nothing depends on when a network first appeared. */
+        for (int i = 0; i < n - 1; i++)
+            for (int j = i + 1; j < n; j++)
+                if (scanSeen[order[j]].rssi > scanSeen[order[i]].rssi) {
+                    int t = order[i]; order[i] = order[j]; order[j] = t;
+                }
+        if (onboarding) {
+            cliPrintf("count=%d\n", n);
+            /* SSID last, so a space in it needs no quoting. */
+            for (int i = 0; i < n; i++)
+                cliPrintf("ap=%d %s %s\n", scanSeen[order[i]].rssi,
+                          scanSeen[order[i]].open ? "open" : "closed",
+                          scanSeen[order[i]].ssid);
+        } else if (n == 0) {
+            cliPrintf("no access points seen yet\n");
+        } else {
+            for (int i = 0; i < n; i++)
+                cliPrintf("%4ddBm  %-6s %s\n", scanSeen[order[i]].rssi,
+                          scanSeen[order[i]].open ? "open" : "closed",
+                          scanSeen[order[i]].ssid);
+        }
+        return;
+    }
+
     if (strcmp(args, "up") == 0) { netUp(); return; }
     if (strcmp(args, "down!") == 0) { netDown(true); return; }
     if (strcmp(args, "down") == 0) { netDown(); return; }
@@ -2021,7 +2130,7 @@ static void netCliCmd(const char* args) {
         return;
     }
 
-    if (*args) { cliPrintf("usage: net [up|down|down!|add|join|delete]\n"); return; }
+    if (*args) { cliPrintf("usage: net [up|down|down!|list|scan|add|join|delete]\n"); return; }
 
     /* Show status — four states: down, connecting, up, going down */
     if (wifiState == ST_OFF) { cliPrintf("wifi: down\n"); return; }
@@ -2354,8 +2463,9 @@ void netInit() {
   cliRegisterCmd("hostname", hostnameCliCmd);
   cliRegisterCmd("ping", pingCliCmd);
 
-  /* Surface a passwordless device once at boot so setup tooling (the flasher)
-   * can prompt for one. The admin realm ships unset until a password is chosen. */
+  /* Surface a passwordless device once at boot, for whoever is watching the
+   * log. The admin realm ships unset until a password is chosen. Setup tooling
+   * does not read this — it asks `auth -O`. */
   if (authRealmUnset("admin")) info("No device password set\n");
   void wgetRegister();   /* wget.cpp — download CLI verb */
   wgetRegister();

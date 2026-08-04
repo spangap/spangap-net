@@ -178,9 +178,13 @@ stored networks.
 net                       WiFi status (state, SSID/IP/DNS, AP detail, traffic)
 net up | down | down!     bring WiFi up / down (graceful) / down immediately
 net list                  list stored networks (* marks the connected one)
+net scan                  access points seen this boot, loudest first
 net add <ssid> [pass]     save a network (quote spaces) and join if not on STA
 net join <ssid>           force-join a known network
 net delete <ssid>         remove a network (and disconnect if it was current)
+
+net -O                    onboarding output: state / ssid / ip / hostname
+net scan -O               onboarding output: count, then one ap= per network
 
 ping [ip] [count]         ICMP echo (default target = router, count = 4)
 
@@ -189,6 +193,39 @@ wget -O <file> <url>      download to a specific file
 ```
 
 Run any of these on-device through `spangap cli "<command>"`.
+
+### `net scan`
+
+Prints the access-point cache the ordinary scan cycle has already built. It does
+**not** start a scan: the connect path scans anyway, so the list is there as soon
+as that has run once.
+
+The cache holds one record per SSID and accumulates across every scan this boot,
+keeping the loudest RSSI a network has ever shown — so the picture fills in over
+time rather than being whatever the most recent single scan happened to hear.
+Hidden SSIDs are skipped, and it is reset only by a reboot. The same cache is
+what limits `scan found …` to one log line per network per boot.
+
+### `-O`, onboarding output
+
+`net -O` and `net scan -O` print machine-readable `key=value` lines and nothing
+else — the contract a flasher provisions against. See
+[onboarding-output.md](../../spangap-core/docs/onboarding-output.md) for the
+format and its rules; the keys are:
+
+```
+net -O          state=ap|sta|connecting|down
+                ssid=…            (when there is one)
+                ip=…              (when there is one)
+                hostname=…
+
+net scan -O     count=<n>
+                ap=<rssi> <open|closed> <ssid>      × n
+```
+
+`count` is emitted first and computed after dropping any SSID that isn't
+representable on one line, so it always equals the number of `ap=` lines that
+follow. `ap=` puts the SSID last, so a space in it needs no quoting.
 
 ### wget
 
