@@ -40,6 +40,10 @@ init:
   - call: mdnsInit
   - call: netLcdRegister
     when: spangap/spangap-lcd
+  # Mono-OLED status page (hostname.local, STA IP, AP SSID/IP) — the tinylcd
+  # sibling of the LCD pane above; lives in conditional/tinylcd/.
+  - call: netTinylcdRegister
+    when: spangap/tinylcd
 
 # Declarative settings panes (lowered to LCD pane + web panel + storage defaults
 # by the build). The mDNS pane is fully static, so it lives here instead of in a
