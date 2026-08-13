@@ -2231,39 +2231,6 @@ static void trafArmHooks(void) {
   if (n->linkoutput != trafLinkoutHook)   { s_origLinkout = n->linkoutput; n->linkoutput = trafLinkoutHook; }
 }
 
-/* nethist: an ITS server that hands a browser the whole traffic ring in one shot
- * on connect, then disconnects — the wifi-graph counterpart of cpuhist, so a
- * freshly-opened web monitor pre-fills instead of accumulating a sample a second.
- * Browser opens a DataChannel labelled "nethist:1". Spawned on demand by that
- * connect (see itsRegisterOnDemand in netTrafficInit) and gone once the blob is
- * out, so it holds a TCB only while it's actually serving. */
-static constexpr uint16_t NETHIST_PORT = 1;
-static int  s_netHistClient  = -1;
-
-static int netHistOnConnect(int handle, const void*, size_t) { s_netHistClient = handle; return 0; }
-
-static void netHistTask(void*) {
-  itsServerInit();
-  itsServerPortOpen(NETHIST_PORT, ITS_PACKET, 1, 0, 8192, 0, 8192);
-  itsServerOnConnect(NETHIST_PORT, netHistOnConnect);
-  /* The itsConnect that spawned us is already handshaking; poll long enough to
-     accept it (its side has a 3 s connect budget), hand over the ring, exit. */
-  itsPoll(pdMS_TO_TICKS(3000));
-  while (itsPoll(0)) {}
-  if (s_netHistClient >= 0) {
-    int h = s_netHistClient; s_netHistClient = -1;
-    const int MAX = 320;                          /* one screen-width of samples */
-    auto* tmp = (NetTrafSample*)gp_alloc((size_t)MAX * sizeof(NetTrafSample));
-    if (tmp) {
-      int n = netTrafficHistory(tmp, MAX);
-      if (n > 0) itsSend(h, tmp, (size_t)n * sizeof(NetTrafSample), pdMS_TO_TICKS(1000));
-      free(tmp);                                  /* n == 0 (no traffic sampled yet): nothing to send */
-    }
-    itsDisconnect(h);                             /* one-shot: blob then close */
-  }
-  killSelf();
-}
-
 /* One per-second sample: diff the cumulative counters, push the delta, and — if
  * a monitor is watching — publish the latest second. Runs on the CPU sampler's
  * beat (core 0). Unsigned subtraction is wrap-safe. */
@@ -2396,9 +2363,6 @@ static void netTrafficStop(void) {
 }
 
 void netTrafficInit(void) {
-  itsRegisterOnDemand("nethist", [] {
-    spawnTask(netHistTask, "nethist", 4096, nullptr, 1, 0, STACK_PSRAM);
-  });
   pmStatsAddSampler(netTrafficTick, nullptr, netTrafficStop);
 }
 
