@@ -47,29 +47,33 @@ init:
 # per-keystroke checks the old panel carried are all gone.
 settings:
   - at:
-      - { id: network, label: "Internet", short: "Internet", order: 2 }
+      # spangap-net names the top-level network menu — every other straddle
+      # contributing there states the bare `id: net`.
+      - { id: net, label: "WiFi & Network", short: "Network", order: 10 }
       - { id: wifi, label: "WiFi", short: "WiFi", order: 1 }
     rows:
       - switch: { label: "Enable", key: "s.net.wifi.enable" }
       - section: "Status"
       # Every row here is a string net.cpp publishes finished — the state and
       # the signal quality in words, the traffic pair as one line.
-      - value: { label: "Status", key: "wifi.sta.state_text" }
-      - value: { label: "SSID", key: "wifi.sta.ssid" }
-        when_key: wifi.sta.up
-      - value: { label: "IP", key: "wifi.sta.ip", copyable: true }
-        when_key: wifi.sta.up
-      - value: { label: "Router", key: "wifi.sta.router" }
-        when_key: wifi.sta.up
-      - value: { label: "Netmask", key: "wifi.sta.netmask" }
-        when_key: wifi.sta.up
-      - value: { label: "DNS", key: "wifi.sta.dns" }
-        when_key: wifi.sta.up
-      - value: { label: "MAC", key: "wifi.mac", copyable: true }
-      - value: { label: "Signal", key: "wifi.sta.signal" }
-        when_key: wifi.sta.up
-      - value: { label: "Traffic", key: "wifi.traffic" }
-        when_key: wifi.sta.up
+      - info:
+          rows:
+            - value: { label: "Status", key: "wifi.sta.state_text" }
+            - value: { label: "SSID", key: "wifi.sta.ssid" }
+              when_key: wifi.sta.up
+            - value: { label: "IP", key: "wifi.sta.ip", copyable: true }
+              when_key: wifi.sta.up
+            - value: { label: "Router", key: "wifi.sta.router" }
+              when_key: wifi.sta.up
+            - value: { label: "Netmask", key: "wifi.sta.netmask" }
+              when_key: wifi.sta.up
+            - value: { label: "DNS", key: "wifi.sta.dns" }
+              when_key: wifi.sta.up
+            - value: { label: "MAC", key: "wifi.mac", copyable: true }
+            - value: { label: "Signal", key: "wifi.sta.signal" }
+              when_key: wifi.sta.up
+            - value: { label: "Traffic", key: "wifi.traffic" }
+              when_key: wifi.sta.up
       - list:
           label: "Known networks"
           key: s.net.wifi.nets
@@ -128,7 +132,7 @@ settings:
       - value: { label: "AP address", key: "wifi.ap.ip", copyable: true }
         when_key: wifi.ap.up
   - at:
-      - { id: network, label: "Internet", order: 2 }
+      - { id: net }
       - { id: mdns, label: "mDNS", short: "mDNS" }
     rows:
       - section: "mDNS"
@@ -138,7 +142,7 @@ settings:
   # System pane (top-level). Rows are defaultless: hostname/tz/server defaults
   # live in the s.net / s.ntp storageDefaultTree (net.cpp / ntp.cpp).
   - at:
-      - { id: system, label: "System", short: "System", order: 1 }
+      - { id: system }
     rows:
       - section: "This System"
       - text: { label: "Hostname", key: "s.net.hostname" }
