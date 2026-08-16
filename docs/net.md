@@ -162,8 +162,8 @@ default MAC).
 
 | Key | Action |
 |---|---|
-| `wifi.scan` | `1` starts publishing `wifi.scanned` (re-scans every 20 s while set). |
-| `wifi.connect` | `<idx>` joins the known network at that array index. |
+| `wifi.scan` | `1` starts publishing `wifi.scanned` (re-scans every 20 s while set). **The re-scan runs while associated too**, and a scan takes the one radio off its channel — so a UI that arms this key owns clearing it, and one left set is a join/rejoin cycle for as long as it stands. |
+| `wifi.connect` | `<idx>` joins the known network at that array index. Like every sentinel here it is **cleared by net as it takes the command**, and a clear arrives at subscribers as an empty value — so a reader of this key must ignore an empty one rather than let `atoi` turn it into index 0. |
 | `wifi.disconnect` | `1` drops the current STA and returns to AP. |
 | `wifi.cmd.add` | `"<ssid>\t<pass>"` adds (or updates) a known network and joins it. |
 | `wifi.cmd.del` | `"<idx>"` removes a known network (array-correct shift). |
@@ -171,6 +171,14 @@ default MAC).
 The browser WiFi panel rewrites `s.net.wifi.nets[]` directly; the on-device LCD
 pane drives the `wifi.cmd.*` sentinels — both surfaces converge on the same
 stored networks.
+
+**A factory-reset boot keeps the radio down.** `netInit` leaves `rtcWantUp`
+false when `spangapSafeMode()` is `SAFE_MODE_FACTORY_RESET`: that boot exists to
+erase the store and restart, and joining a network, standing the AP up or
+answering for a hostname all describe a device that is about to stop existing.
+The stack still comes up — the console, the log and the socket relay ride it.
+Backup and restore keep the radio: those modes are *reached* over the network.
+See [safe-mode.md](../../spangap-core/docs/safe-mode.md).
 
 ## CLI
 

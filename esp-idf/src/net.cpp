@@ -1308,6 +1308,21 @@ static void netTaskFn(void* arg) {
   });
   storageSubscribeChanges("wifi.connect", ON_CHANGE {
     if (strcmp(key, "wifi.connect") != 0) return;  /* prefix also matches wifi.connecting etc */
+    /* An EMPTY value is this sentinel being cleared, not a request to join
+     * anything. The task loop deletes the key as it takes the command, and a
+     * delete arrives here as val="" — which atoi() reads as 0, a perfectly
+     * valid network index. Without this line, taking a connect command posts
+     * another one for net 0, whose own clear posts another, forever: the device
+     * associates, opens its ports, announces itself, and immediately tears the
+     * association down to "join" the network it is already on.
+     *
+     * It only ever bit after a connect that CAME from the sentinel — the
+     * scan path and the browser's array rewrite never touch it — which is why
+     * it surfaced when onboarding started adding the first network through
+     * `wifi.cmd.add` (which joins by writing this key). The other three
+     * sentinels have carried this guard from the start; this one was the odd
+     * one out, and 0 is exactly the index an empty string parses to. */
+    if (!val || !*val) return;
     int idx = atoi(val);
     if (idx >= 0 && idx < MAX_STA_NETWORKS) {
       uint8_t buf[2] = { NET_CMD_CONNECT, (uint8_t)idx };
@@ -2452,6 +2467,14 @@ void netInit() {
     rtcApWindowUsed = false;   /* real reboot re-arms the timed AP window */
   }
   else if (!wifiEnabled) rtcWantUp = false;
+  /* A factory-reset boot has nowhere to be. It exists to erase the store and
+   * restart, and everything a radio would be for — joining the network this
+   * device is configured for, standing up its AP, answering for a hostname —
+   * describes a device that is about to stop existing. The stack still comes up
+   * (the console, the log and the socket relay ride it); only the radio stays
+   * down. Backup and restore are the other way round: those safe modes are
+   * reached over the network and need it. */
+  if (spangapSafeMode() == SAFE_MODE_FACTORY_RESET) rtcWantUp = false;
 
   readySem = xSemaphoreCreateBinary();
   wifiConnectedSem = xSemaphoreCreateBinary();

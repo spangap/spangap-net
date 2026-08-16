@@ -77,6 +77,35 @@ void onDeleteKnown(lv_event_t* e) {
   storageSet("wifi.cmd.del", v);
 }
 void onScan(lv_event_t*) { storageSet("wifi.scan", "1"); }
+
+/* ---- the scan must not outlive the looking ----
+ * `wifi.scan=1` is not a one-shot: net re-scans every 20 s while it is set, and
+ * it does so WHILE ASSOCIATED — one radio, off its channel for the length of a
+ * full-band scan, which the AP is entitled to read as a station that left. A
+ * sentinel left set is therefore a join/rejoin cycle that lasts until the next
+ * reboot.
+ *
+ * Clearing it on pane delete is not enough, because a pane is not deleted when
+ * the operator stops looking at it: Back pops the page (delete, handled), but
+ * Home only HIDES the Settings app's layer — the pane object, and the scan
+ * behind it, survive with nobody watching. So visibility is what the scan
+ * follows, checked on a timer that lives and dies with the pane. */
+lv_obj_t*   s_pane      = nullptr;
+lv_timer_t* s_scanWatch = nullptr;
+
+bool s_wasLooking = true;
+
+void scanFollowVisibility(lv_timer_t*) {
+    if (!s_pane || !lv_obj_is_valid(s_pane)) return;
+    const bool looking = lv_obj_is_visible(s_pane);
+    if (looking == s_wasLooking) return;
+    s_wasLooking = looking;
+    /* Clear on the way out, and nothing on the way back in: re-arming here
+     * would hold the key up against whatever else has an interest in it (the
+     * onboarding wizard's own list, a browser panel), and the pane's Scan
+     * button is how a fresh list is asked for anyway. */
+    if (!looking) storageSet("wifi.scan", "0");
+}
 void onPickScanned(lv_event_t* e) {
   int idx = (int)(intptr_t)lv_event_get_user_data(e);
   std::string ssid = arrField("wifi.scanned", idx, "ssid");
@@ -218,6 +247,8 @@ void onWifiStorage(const char* /*key*/, const char* /*val*/) {
 void onPaneDelete(lv_event_t*) {
   s_knownBox = s_scanBox = s_ssidTa = s_passTa = nullptr;
   s_apSwitch = s_apSecsTa = nullptr;
+  s_pane = nullptr;
+  if (s_scanWatch) { lv_timer_delete(s_scanWatch); s_scanWatch = nullptr; }
   memset(s_apRows, 0, sizeof(s_apRows));
   if (s_subscribed) {
     /* These prefixes are ours alone (no lcdSetting* binding uses them), so a
@@ -312,6 +343,12 @@ void wifiSettingsPane(void* arg) {
   rebuildKnown();
   rebuildScan();
   apApply();
+
+  /* Follow the pane's visibility from here on (above). 2 s is well inside the
+   * 20 s re-scan period, so leaving the pane costs at most one more scan. */
+  s_pane = p;
+  s_wasLooking = true;
+  if (!s_scanWatch) s_scanWatch = lv_timer_create(scanFollowVisibility, 2000, nullptr);
 
   if (!s_subscribed) {
     storageSubscribeChanges("s.net.wifi.nets", onWifiStorage);
