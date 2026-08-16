@@ -31,6 +31,8 @@
 #include <cstring>
 #include <cstdio>
 #include <string>
+#include <map>
+#include <vector>
 #include "esp_heap_caps.h"
 #include "esp_random.h"
 #include "esp_mac.h"
@@ -98,6 +100,13 @@ static volatile bool cmdWifiAdd = false;
 static char          cmdWifiAddBuf[96];
 static volatile bool cmdWifiDel = false;
 static volatile int  cmdWifiDelIdx = -1;
+/* The settings collection's sentinels (wifi.net.*). Their subscribers run on
+ * this task — they are registered from it — but they only RAISE a flag: the
+ * payload stays in storage and the loop reads it at the top of the next pass,
+ * so an array rewrite never happens inside a storage-notification callback and
+ * nothing has to squeeze a JSON object through an ITS aux frame. */
+static volatile bool cmdNetAdd = false, cmdNetSet = false;
+static volatile bool cmdNetRemove = false, cmdNetOrder = false, cmdNetConnect = false;
 
 /* RTC state: survives deep sleep. On cold boot, boot file runs "net up". */
 RTC_DATA_ATTR static bool rtcWantUp = false;
@@ -717,15 +726,22 @@ static int staNetFindBySsid(const char* ssid);   /* defined below; used by the t
 
 /** Remove known network [idx], shifting later entries down and dropping the
  *  tail — the array-correct delete (a bare delete of an index would leave a
- *  hole). Shared by the `net delete` CLI verb and the on-device `wifi.cmd.del`
- *  sentinel (the LCD WiFi pane writes that; the browser rewrites the array). */
+ *  hole). Shared by the `net delete` CLI verb, the wifi.cmd.del sentinel and
+ *  the settings collection's wifi.net.remove. */
+/* The fields one known network carries. `id` is a small opaque number this
+ * task hands out and never reuses while an entry lives: the settings collection
+ * addresses items by it, and it has to survive the reorders and deletes that
+ * shuffle every index. */
+static const char* const STA_NET_FIELDS[] =
+    { "id", "ssid", "pass", "ip", "gw", "mask", "dns", "mac" };
+
 static void staNetDeleteIdx(int idx) {
   int total = staNetCount();
   if (idx < 0 || idx >= total) return;
   storageBegin();
   for (int i = idx; i < total - 1; i++) {
     char src[64], dst[64];
-    for (const char* f : { "ssid", "pass", "ip", "gw", "mask", "dns", "mac" }) {
+    for (const char* f : STA_NET_FIELDS) {
       snprintf(src, sizeof(src), "s.net.wifi.nets.%d.%s", i + 1, f);
       snprintf(dst, sizeof(dst), "s.net.wifi.nets.%d.%s", i, f);
       std::string v = storageGetStr(src, "");
@@ -737,6 +753,193 @@ static void staNetDeleteIdx(int idx) {
   snprintf(tail, sizeof(tail), "s.net.wifi.nets.%d", total - 1);
   storageDeleteTree(tail);
   storageEnd();
+}
+
+/* ---- the known-networks collection ----
+ *
+ * The settings surfaces never write s.net.wifi.nets. They write wifi.net.add /
+ * .remove / .set / .order and this task applies them, which is what lets one
+ * description drive the browser and the display and keeps validation in exactly
+ * one place. A rejection is a sentence on wifi.net.error.
+ *
+ * Everything below runs on the net task (the sentinels forward over ITS like
+ * connect does), so array writes never happen on the storage actor. */
+
+static std::string staNetField(int idx, const char* field) {
+  char key[64];
+  snprintf(key, sizeof(key), "s.net.wifi.nets.%d.%s", idx, field);
+  return storageGetStr(key, "");
+}
+
+static int staNetFindById(const char* id) {
+  if (!id || !*id) return -1;
+  int n = staNetCount();
+  for (int i = 0; i < n; i++) if (staNetField(i, "id") == id) return i;
+  return -1;
+}
+
+/** The next unused id. Ids are only ever compared, so a running maximum is
+ *  enough and nothing has to remember what was handed out before. */
+static std::string staNetNextId() {
+  int best = 0, n = staNetCount();
+  for (int i = 0; i < n; i++) {
+    int v = atoi(staNetField(i, "id").c_str());
+    if (v > best) best = v;
+  }
+  char buf[12];
+  snprintf(buf, sizeof(buf), "%d", best + 1);
+  return buf;
+}
+
+/** Give every entry an id, for a store written before ids existed. Idempotent. */
+static void staNetEnsureIds() {
+  int n = staNetCount();
+  bool any = false;
+  for (int i = 0; i < n; i++) if (staNetField(i, "id").empty()) { any = true; break; }
+  if (!any) return;
+  storageBegin();
+  for (int i = 0; i < n; i++) {
+    if (!staNetField(i, "id").empty()) continue;
+    char k[64], v[12];
+    snprintf(v, sizeof(v), "%d", i + 1);
+    snprintf(k, sizeof(k), "s.net.wifi.nets.%d.id", i);
+    storageSet(k, v);
+  }
+  storageEnd();
+}
+
+static void staNetError(const char* why) { storageSet("wifi.net.error", why); }
+
+/** Accepted-mutation ack, shared by every wifi.net.* sentinel: the open form
+ *  closes when this moves. A monotonic per-boot counter, not a read-increment —
+ *  reads see the committed tree, and the actor may not have applied the
+ *  previous bump yet. */
+static void staNetAck() {
+  static int ack = 0;
+  storageSet("wifi.net.done", ++ack);
+}
+
+/** What is wrong with this network, or "" if nothing is. The one place that
+ *  decides — an add form and an item editor both land here, and neither carries
+ *  a rule of its own. */
+static std::string staNetRejection(const std::string& ssid, const std::string& ip,
+                                   const std::string& mask) {
+  if (ssid.empty())      return "A network needs an SSID.";
+  if (ssid.size() > 32)  return "An SSID is at most 32 characters.";
+  /* A manual address is all-or-nothing: an IP without a netmask cannot be
+   * turned into a route, and the radio would associate and then go nowhere. */
+  if (!ip.empty() && mask.empty()) return "A manual IP needs a netmask.";
+  if (ip.empty() && !mask.empty()) return "A netmask without an IP does nothing.";
+  return "";
+}
+
+/** Write one entry's fields at `idx`, dropping the empty ones so an absent
+ *  field stays absent rather than becoming "". Caller holds the transaction. */
+static void staNetWrite(int idx, const std::string& id,
+                        const std::map<std::string, std::string>& fields) {
+  char k[64];
+  snprintf(k, sizeof(k), "s.net.wifi.nets.%d.id", idx);
+  storageSet(k, id.c_str());
+  for (const char* f : STA_NET_FIELDS) {
+    if (strcmp(f, "id") == 0) continue;
+    snprintf(k, sizeof(k), "s.net.wifi.nets.%d.%s", idx, f);
+    auto it = fields.find(f);
+    if (it == fields.end() || it->second.empty()) storageUnset(k);
+    else                                          storageSet(k, it->second.c_str());
+  }
+}
+
+/** The fields of a `wifi.net.add` / `.set` payload, which is the form's field
+ *  object as JSON. Absent members read as empty, which is what erases them. */
+static std::map<std::string, std::string> staNetParse(const char* json, std::string* idOut) {
+  std::map<std::string, std::string> out;
+  cJSON* o = cJSON_Parse(json);
+  if (!o) return out;
+  for (const char* f : STA_NET_FIELDS) {
+    cJSON* m = cJSON_GetObjectItem(o, f);
+    if (cJSON_IsString(m)) out[f] = m->valuestring;
+  }
+  cJSON* id = cJSON_GetObjectItem(o, "_id");
+  if (idOut && cJSON_IsString(id)) *idOut = id->valuestring;
+  cJSON_Delete(o);
+  return out;
+}
+
+/** Add a network from a form payload, or say why not. An SSID already known is
+ *  an update of that entry rather than a second copy of it — which is also what
+ *  makes adopting a scanned network idempotent. */
+static void staNetAddJson(const char* json) {
+  auto f = staNetParse(json, nullptr);
+  std::string why = staNetRejection(f["ssid"], f["ip"], f["mask"]);
+  if (!why.empty()) { staNetError(why.c_str()); return; }
+  int idx = staNetFindBySsid(f["ssid"].c_str());
+  std::string id = (idx >= 0) ? staNetField(idx, "id") : staNetNextId();
+  if (idx < 0) idx = staNetCount();
+  storageBegin();
+  staNetWrite(idx, id, f);
+  staNetError("");
+  storageEnd();
+  staNetAck();
+  info("added '%s' at %d\n", f["ssid"].c_str(), idx);
+  /* Adding a network is asking to be on it. */
+  char v[8];
+  snprintf(v, sizeof(v), "%d", idx);
+  storageSet("wifi.connect", v);
+}
+
+/** Commit an item editor's fields against the entry it names. */
+static void staNetSetJson(const char* json) {
+  std::string id;
+  auto f = staNetParse(json, &id);
+  int idx = staNetFindById(id.c_str());
+  if (idx < 0) { staNetError("That network is no longer configured."); return; }
+  std::string why = staNetRejection(f["ssid"], f["ip"], f["mask"]);
+  if (!why.empty()) { staNetError(why.c_str()); return; }
+  storageBegin();
+  staNetWrite(idx, id, f);
+  staNetError("");
+  storageEnd();
+  staNetAck();
+}
+
+/** Apply an id order as a PREFERENCE PERMUTATION: recognized ids move into the
+ *  stated relative order, unknown ids are ignored, and anything the payload
+ *  never mentions keeps its place. That is what makes a drag idempotent and
+ *  harmless against an add or delete that raced it. */
+static void staNetOrder(const char* csv) {
+  int n = staNetCount();
+  if (n <= 1) return;
+  std::vector<std::string> wanted;
+  for (const char* p = csv; p && *p; ) {
+    const char* comma = strchr(p, ',');
+    wanted.push_back(comma ? std::string(p, comma - p) : std::string(p));
+    if (!comma) break;
+    p = comma + 1;
+  }
+  /* Snapshot every entry, then rebuild: the positions the payload mentions are
+   * filled from `wanted` in order, the rest keep the slots they already had. */
+  std::vector<std::map<std::string, std::string>> items(n);
+  std::vector<std::string> ids(n);
+  for (int i = 0; i < n; i++) {
+    ids[i] = staNetField(i, "id");
+    for (const char* f : STA_NET_FIELDS)
+      if (strcmp(f, "id") != 0) items[i][f] = staNetField(i, f);
+  }
+  std::vector<int> slots;          /* the positions being permuted */
+  std::vector<int> order;          /* which entry lands in each of them */
+  for (int i = 0; i < n; i++)
+    for (const std::string& w : wanted)
+      if (ids[i] == w) { slots.push_back(i); break; }
+  for (const std::string& w : wanted)
+    for (int i = 0; i < n; i++)
+      if (ids[i] == w) { order.push_back(i); break; }
+  if (slots.size() != order.size() || slots.empty()) return;
+  storageBegin();
+  for (size_t s = 0; s < slots.size(); s++)
+    staNetWrite(slots[s], ids[order[s]], items[order[s]]);
+  staNetError("");
+  storageEnd();
+  staNetAck();
 }
 
 /* Access points seen this boot, one record per SSID. The cache accumulates
@@ -887,7 +1090,10 @@ static void setUpstream(bool up) {
 }
 
 /** Perform a WiFi scan and publish results to wifi.scanned as a JSON array.
- *  Each element: {ssid, bssid, rssi, locked}. Sorted by RSSI (strongest first). */
+ *  Each element: {ssid, bssid, rssi, locked} plus `name` and `detail` — the two
+ *  lines a settings row shows, rendered here. A settings surface should be able
+ *  to list what the radio can see without knowing that an empty SSID means a
+ *  hidden network or which dBm figures deserve which bars. */
 static void publishScanResults() {
   wifi_scan_config_t scan_config = {};
   esp_err_t e = esp_wifi_scan_start(&scan_config, true);
@@ -930,12 +1136,25 @@ static void publishScanResults() {
              ap_list[i].bssid[3], ap_list[i].bssid[4], ap_list[i].bssid[5]);
     cJSON_AddStringToObject(obj, "bssid", bssid);
     cJSON_AddNumberToObject(obj, "rssi", ap_list[i].rssi);
-    cJSON_AddNumberToObject(obj, "locked", ap_list[i].authmode != WIFI_AUTH_OPEN ? 1 : 0);
+    bool locked = ap_list[i].authmode != WIFI_AUTH_OPEN;
+    cJSON_AddNumberToObject(obj, "locked", locked ? 1 : 0);
+    cJSON_AddStringToObject(obj, "name",
+                            ap_list[i].ssid[0] ? (const char*)ap_list[i].ssid : "(hidden)");
+    int r = ap_list[i].rssi;
+    const char* bars = r >= -55 ? "\xE2\x96\x82\xE2\x96\x84\xE2\x96\x86\xE2\x96\x88"
+                     : r >= -65 ? "\xE2\x96\x82\xE2\x96\x84\xE2\x96\x86"
+                     : r >= -75 ? "\xE2\x96\x82\xE2\x96\x84"
+                                : "\xE2\x96\x82";
+    char detail[48];
+    snprintf(detail, sizeof(detail), "%s  %d dBm%s", bars, r, locked ? "  \xF0\x9F\x94\x92" : "");
+    cJSON_AddStringToObject(obj, "detail", detail);
     cJSON_AddItemToArray(arr, obj);
   }
   free(ap_list);
   storageSetTree("wifi.scanned", arr);
 }
+
+static void staNetPublishStatus();
 
 /** Publish current WiFi status as ephemeral keys.
  *  wifi.sta.state — "off", "connecting", "connected"
@@ -965,6 +1184,13 @@ static void publishWifiStatus() {
   bool connecting = (wifiState == ST_SCANNING);
   storageSet("wifi.sta.state", wifiState == ST_STA_CONNECTED ? "connected"
                                : connecting ? "connecting" : "off");
+  /* The same state as the words a settings row shows, and the traffic pair as
+   * the one line it shows. Both surfaces render these verbatim. */
+  storageSet("wifi.sta.state_text", wifiState == ST_STA_CONNECTED ? "Connected"
+                                    : connecting ? "Connecting\xE2\x80\xA6" : "Off");
+  char traffic[48];
+  snprintf(traffic, sizeof(traffic), "in %s, out %s", inBuf, outBuf);
+  storageSet("wifi.traffic", traffic);
   if (wifiState == ST_STA_CONNECTED) {
     wifi_ap_record_t ap_info = {};
     const char* ssid = "";
@@ -989,7 +1215,17 @@ static void publishWifiStatus() {
     esp_ip4addr_ntoa(&dns1.ip.u_addr.ip4, dns1s, sizeof(dns1s));
     storageSet("wifi.sta.dns", dns1s);
     storageSet("wifi.sta.up", 1);
+    /* Signal quality as a phrase. Which dBm counts as "Good" is a judgement
+     * about this radio, so it is made here rather than by each surface guessing
+     * the same thresholds. */
+    int rssi = (int)ap_info.rssi;
+    const char* quality = rssi >= -50 ? "Excellent" : rssi >= -60 ? "Good"
+                        : rssi >= -70 ? "Fair" : "Weak";
+    char sig[40];
+    snprintf(sig, sizeof(sig), "%s (%d dBm)", quality, rssi);
+    storageSet("wifi.sta.signal", sig);
   } else {
+    storageSet("wifi.sta.signal", "");
     storageSet("wifi.sta.ssid", "");
     storageSet("wifi.sta.ip", "");
     storageSet("wifi.sta.router", "");
@@ -1023,6 +1259,38 @@ static void publishWifiStatus() {
     storageSet("wifi.ap.ip", "");
     storageSet("wifi.ap.netmask", "");
     storageSet("wifi.ap.up", 0);
+  }
+  /* The access point's own switch is a value, not a flag: -1 is off, 0 is "up
+   * until a known network appears", N is "N idle seconds". A settings toggle
+   * needs a plain truthy gate for the rows that only matter while it is on. */
+  storageSet("wifi.ap.enabled", storageGetInt("s.net.wifi.ap.active_for", 300) >= 0 ? 1 : 0);
+  storageEnd();
+  staNetPublishStatus();
+}
+
+/** One status pill per known network, as packed "text|colour". Which network is
+ *  connected and which are merely in range is something only this task knows,
+ *  and saying it in finished words means neither settings surface has to
+ *  cross-reference the scan cache against the configured list. */
+static bool scanCacheHas(const char* ssid) {
+  return ssid && *ssid && scanSeenFind(ssid) != nullptr;
+}
+
+static void staNetPublishStatus() {
+  int n = staNetCount();
+  std::string connected;
+  if (wifiState == ST_STA_CONNECTED) connected = storageGetStr("wifi.sta.ssid", "");
+  storageBegin();
+  for (int i = 0; i < n; i++) {
+    std::string id   = staNetField(i, "id");
+    std::string ssid = staNetField(i, "ssid");
+    if (id.empty()) continue;
+    const char* pill = "";
+    if (!ssid.empty() && ssid == connected)  pill = "connected|green";
+    else if (scanCacheHas(ssid.c_str()))     pill = "in range|blue";
+    char k[64];
+    snprintf(k, sizeof(k), "wifi.netstat.%s", id.c_str());
+    storageSet(k, pill);
   }
   storageEnd();
 }
@@ -1352,6 +1620,26 @@ static void netTaskFn(void* arg) {
     itsSendAuxByTaskHandle(netHandle, NET_CMD_PORT, buf, 2, pdMS_TO_TICKS(100));
   });
 
+  /* The settings collection: wifi.net.add / .set / .remove / .order / .connect.
+   * The UI never writes s.net.wifi.nets — it writes these, and this task is the
+   * array's only writer, which is what puts validation in one place and lets a
+   * rejection come back as a sentence on wifi.net.error. */
+  storageSubscribeChanges("wifi.net.add", ON_CHANGE {
+    if (strcmp(key, "wifi.net.add") == 0 && val && *val) cmdNetAdd = true;
+  });
+  storageSubscribeChanges("wifi.net.set", ON_CHANGE {
+    if (strcmp(key, "wifi.net.set") == 0 && val && *val) cmdNetSet = true;
+  });
+  storageSubscribeChanges("wifi.net.remove", ON_CHANGE {
+    if (strcmp(key, "wifi.net.remove") == 0 && val && *val) cmdNetRemove = true;
+  });
+  storageSubscribeChanges("wifi.net.order", ON_CHANGE {
+    if (strcmp(key, "wifi.net.order") == 0 && val && *val) cmdNetOrder = true;
+  });
+  storageSubscribeChanges("wifi.net.connect", ON_CHANGE {
+    if (strcmp(key, "wifi.net.connect") == 0 && val && *val) cmdNetConnect = true;
+  });
+
   /* Master WiFi switch. s.net.wifi.enable was a defined config key (default 1)
    * that nothing consumed — setting it 0 did nothing, the radio kept scanning.
    * Bring net down/up to match; cold boot also seeds rtcWantUp from it (netInit).
@@ -1374,6 +1662,10 @@ static void netTaskFn(void* arg) {
   });
 
   wifiNetifInit();
+
+  /* Every known network needs the id the settings collection addresses it by,
+   * including on a store written before ids existed. */
+  staNetEnsureIds();
 
   xSemaphoreGive(readySem);  /* unblock netInit — task is running */
 
@@ -1522,12 +1814,13 @@ static void netTaskFn(void* arg) {
       }
     }
 
-    /* On-device WiFi add (the LCD WiFi pane writes wifi.cmd.add="<ssid>\t<pass>";
-     * the browser rewrites s.net.wifi.nets[] directly). Captured once by the
-     * subscriber, applied here in the net task so the array writes run in a safe
-     * context. The join is emitted as a SEPARATE wifi.connect op: storage ops
-     * commit in emit order, so ssid/pass are committed before the connect
-     * handler reads them — the same ordered add-then-connect the browser uses. */
+    /* The compact add form: wifi.cmd.add="<ssid>\t<pass>", written by the
+     * first-run wizard and the `net` CLI where a JSON object would be a
+     * ceremony. The settings collection uses wifi.net.add instead, which
+     * carries the full field set. Captured once by the subscriber, applied here
+     * in the net task so the array writes run in a safe context. The join is
+     * emitted as a SEPARATE wifi.connect op: storage ops commit in emit order,
+     * so ssid/pass are committed before the connect handler reads them. */
     if (cmdWifiAdd) {
       cmdWifiAdd = false;
       storageDeleteTree("wifi.cmd.add");
@@ -1537,9 +1830,11 @@ static void netTaskFn(void* arg) {
       std::string pass = tab == std::string::npos ? "" : add.substr(tab + 1);
       if (!ssid.empty()) {
         int idx = staNetFindBySsid(ssid.c_str());
+        std::string id = (idx >= 0) ? staNetField(idx, "id") : staNetNextId();
         if (idx < 0) idx = staNetCount();
         char k[64], v[8];
         storageBegin();
+        snprintf(k, sizeof(k), "s.net.wifi.nets.%d.id",   idx); storageSet(k, id.c_str());
         snprintf(k, sizeof(k), "s.net.wifi.nets.%d.ssid", idx); storageSet(k, ssid.c_str());
         snprintf(k, sizeof(k), "s.net.wifi.nets.%d.pass", idx); storageSet(k, pass.c_str());
         snprintf(v, sizeof(v), "%d", idx); storageSet("wifi.connect", v);
@@ -1553,6 +1848,50 @@ static void netTaskFn(void* arg) {
       cmdWifiDel = false;
       storageDeleteTree("wifi.cmd.del");
       staNetDeleteIdx(cmdWifiDelIdx);
+      continue;
+    }
+
+    /* The settings collection's sentinels. Each reads its own payload, applies
+     * it, and clears the key — the clear is what lets the same request be made
+     * twice, and the reason a rejected one leaves wifi.net.error set. */
+    if (cmdNetAdd) {
+      cmdNetAdd = false;
+      std::string payload = storageGetStr("wifi.net.add", "");
+      storageDeleteTree("wifi.net.add");
+      staNetAddJson(payload.c_str());
+      continue;
+    }
+    if (cmdNetSet) {
+      cmdNetSet = false;
+      std::string payload = storageGetStr("wifi.net.set", "");
+      storageDeleteTree("wifi.net.set");
+      staNetSetJson(payload.c_str());
+      continue;
+    }
+    if (cmdNetRemove) {
+      cmdNetRemove = false;
+      std::string id = storageGetStr("wifi.net.remove", "");
+      storageDeleteTree("wifi.net.remove");
+      int idx = staNetFindById(id.c_str());
+      if (idx < 0) staNetError("That network is no longer configured.");
+      else { staNetDeleteIdx(idx); staNetError(""); staNetAck(); }
+      continue;
+    }
+    if (cmdNetOrder) {
+      cmdNetOrder = false;
+      std::string csv = storageGetStr("wifi.net.order", "");
+      storageDeleteTree("wifi.net.order");
+      staNetOrder(csv.c_str());
+      continue;
+    }
+    if (cmdNetConnect) {
+      cmdNetConnect = false;
+      std::string id = storageGetStr("wifi.net.connect", "");
+      storageDeleteTree("wifi.net.connect");
+      int idx = staNetFindById(id.c_str());
+      /* wifi.connect addresses a network by index, which is what every other
+       * caller has; the collection knows only ids, so the translation is here. */
+      if (idx >= 0) { char v[12]; snprintf(v, sizeof(v), "%d", idx); storageSet("wifi.connect", v); }
       continue;
     }
 

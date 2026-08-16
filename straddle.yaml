@@ -3,24 +3,21 @@
 # Pulled in by any straddle that needs WiFi/TCP/UDP — RNS-over-TCP,
 # AutoInterface UDP-multicast, HTTPS server, OTA, ACME, etc. A LoRa- or
 # ESPNOW-only node skips this entirely. Owns its own frontends: the on-device
-# WiFi LCD pane (netLcdRegister, when: spangap-lcd) plus the declarative mDNS
-# pane (settings: block below), and the browser WiFi/mDNS panels
-# (browser_register: registerNet, when spangap-web stages the SPA shell).
+# WiFi, mDNS and System settings (the settings: block below), which the build
+# lowers to both surfaces.
 schema_version: 1
 name: spangap/spangap-net
 prefix: net
 version: 0.0.0
 firmware: esp-idf
-browser: browser
 platforms: [idf]
 # spangap-core is implicit (the empty-prefix platform foundation) — not listed.
 # Remote-access services ride on the IP stack: anything that pulls in net gets
 # ACME / UPnP / WireGuard / DuckDNS / sshd staged by default (each hard-requires
 # net anyway). They carry their own when:-gated init hooks plus a browser_register
 # hook, so a build that drops one with `spangap build --without spangap/<name>`
-# compiles AND un-bundles its UI cleanly. (The on-device WiFi Settings pane
-# registers via the when: spangap/spangap-lcd netLcdRegister hook below, and the
-# mDNS pane is declarative — both ride on whoever staged lcd, not on a net install.)
+# compiles AND un-bundles its UI cleanly. (Every settings pane this straddle
+# owns is declarative, so it rides on whoever staged lcd, not on a net install.)
 additional_installs:
   - spangap/acme
   - spangap/upnp
@@ -38,43 +35,126 @@ init:
   - call: netInit
   - call: ntpInit
   - call: mdnsInit
-  - call: netLcdRegister
-    when: spangap/spangap-lcd
-  # Mono-OLED status page (hostname.local, STA IP, AP SSID/IP) — the tinylcd
-  # sibling of the LCD pane above; lives in conditional/tinylcd/.
+  # Mono-OLED status page (hostname.local, STA IP, AP SSID/IP); lives in
+  # conditional/tinylcd/.
   - call: netTinylcdRegister
     when: spangap/tinylcd
 
-# Declarative settings panes (lowered to LCD pane + web panel + storage defaults
-# by the build). The mDNS pane is fully static, so it lives here instead of in a
-# hand-written mdns_lcd.cpp / MdnsPanel.vue / storageDefault() trio. WiFi stays
-# hand-written (scan dialog, known-networks array — a custom flow).
+# Declarative settings (lowered to both surfaces + storage defaults by the
+# build). WiFi included: the known networks are a collection, net.cpp owns every
+# mutation through the wifi.net.* sentinels and validates there, and the scan is
+# a candidates clause — so the scan dialog, the array rewriting and the
+# per-keystroke checks the old panel carried are all gone.
 settings:
-  - menu:
-      - { id: network, label: "Internet", placement: 2 }
-      - { id: mdns, label: "mDNS" }
+  - at:
+      - { id: network, label: "Internet", short: "Internet", order: 2 }
+      - { id: wifi, label: "WiFi", short: "WiFi", order: 1 }
+    rows:
+      - switch: { label: "Enable", key: "s.net.wifi.enable" }
+      - section: "Status"
+      # Every row here is a string net.cpp publishes finished — the state and
+      # the signal quality in words, the traffic pair as one line.
+      - value: { label: "Status", key: "wifi.sta.state_text" }
+      - value: { label: "SSID", key: "wifi.sta.ssid" }
+        when_key: wifi.sta.up
+      - value: { label: "IP", key: "wifi.sta.ip", copyable: true }
+        when_key: wifi.sta.up
+      - value: { label: "Router", key: "wifi.sta.router" }
+        when_key: wifi.sta.up
+      - value: { label: "Netmask", key: "wifi.sta.netmask" }
+        when_key: wifi.sta.up
+      - value: { label: "DNS", key: "wifi.sta.dns" }
+        when_key: wifi.sta.up
+      - value: { label: "MAC", key: "wifi.mac", copyable: true }
+      - value: { label: "Signal", key: "wifi.sta.signal" }
+        when_key: wifi.sta.up
+      - value: { label: "Traffic", key: "wifi.traffic" }
+        when_key: wifi.sta.up
+      - list:
+          label: "Known networks"
+          key: s.net.wifi.nets
+          id: id
+          item: "{ssid}"
+          # net.cpp publishes the pill for each known network — which one is
+          # connected and which are merely in range is something only it knows.
+          status: "wifi.netstat.{id}"
+          empty: "No networks configured."
+          orderable: true
+          cmd: wifi.net
+          add:
+            - label: "Add network"
+              form:
+                title: "Add network"
+                submit: "Add"
+                fields:
+                  - text: { label: "Network name", field: ssid }
+                  - text: { label: "Password", field: pass, secret: true, placeholder: "leave empty if open" }
+          remove: { confirm: "Forget {ssid}?" }
+          actions:
+            - { label: "Connect", do: { set: { key: "wifi.net.connect", value: "{id}" } } }
+          edit:
+            - text:   { label: "Network name", field: ssid }
+            - text:   { label: "Password", field: pass, secret: true }
+            - section: "Address"
+            - caption: "Leave the IP blank for DHCP."
+            - text: { label: "IP", field: ip }
+            - text: { label: "Netmask", field: mask, default: "255.255.255.0" }
+              when_key: "{ip}"
+            - text: { label: "Gateway", field: gw }
+              when_key: "{ip}"
+            - text: { label: "DNS", field: dns }
+              when_key: "{ip}"
+            - section: "Hardware address"
+            - text: { label: "MAC", field: mac, placeholder: "blank = this device's own" }
+          # Scan-and-adopt. net.cpp renders each result's two lines (name, and
+          # bars + dBm + lock marker) so neither surface draws signal strength.
+          candidates:
+            key: wifi.scanned
+            item: "{name}"
+            subtitle: "{detail}"
+            refresh: { label: "Scan for networks", do: { set: { key: "wifi.scan", value: "1", edge: true } } }
+      - section: "Access point"
+      - caption: "The fallback way in. 0 keeps it up until a known network appears; a number of seconds shuts it down after that much idle time, once per boot."
+      - slider: { label: "Active for (s)", key: "s.net.wifi.ap.active_for", min: -1, max: 3600 }
+      - caption: "-1 disables the access point. With no other network configured that makes this device unreachable."
+      - text: { label: "SSID", key: "s.net.wifi.ap.ssid" }
+        when_key: wifi.ap.enabled
+      - text: { label: "Password", key: "s.net.wifi.ap.pass" }
+        when_key: wifi.ap.enabled
+      - text: { label: "IP", key: "s.net.wifi.ap.ip" }
+        when_key: wifi.ap.enabled
+      - text: { label: "Netmask", key: "s.net.wifi.ap.mask" }
+        when_key: wifi.ap.enabled
+      - value: { label: "AP address", key: "wifi.ap.ip", copyable: true }
+        when_key: wifi.ap.up
+  - at:
+      - { id: network, label: "Internet", order: 2 }
+      - { id: mdns, label: "mDNS", short: "mDNS" }
     rows:
       - section: "mDNS"
       - switch: { label: "Enable", key: "s.net.mdns_enable", default: 1 }
       - text:   { label: "HTTP port", key: "s.net.mdns.http" }
       - text:   { label: "HTTPS port", key: "s.net.mdns.https" }
-  # System pane (top-level). web: false — SystemPanel.vue keeps the web leaf (it
-  # has the searchable timezone picker). Rows are defaultless: hostname/tz/server
-  # defaults live in the s.net / s.ntp storageDefaultTree (net.cpp / ntp.cpp).
-  - menu:
-      - { id: system, label: "System", placement: 1 }
-    web: false
+  # System pane (top-level). Rows are defaultless: hostname/tz/server defaults
+  # live in the s.net / s.ntp storageDefaultTree (net.cpp / ntp.cpp).
+  - at:
+      - { id: system, label: "System", short: "System", order: 1 }
     rows:
       - section: "This System"
       - text: { label: "Hostname", key: "s.net.hostname" }
       - section: "Time & Date"
-      - text: { label: "Timezone", key: "s.ntp.tz" }
+      # The zone list is device data (a 600-entry file the browser refreshes),
+      # so it cannot be a static option list here. The form submits a name and
+      # ntp.cpp checks it resolves before storing it — a miss comes back as a
+      # sentence rather than being silently accepted.
+      - value: { label: "Timezone", key: "s.ntp.tz" }
+      - button:
+          label: "Set timezone"
+          do:
+            form:
+              title: "Set timezone"
+              submit: "Set"
+              cmd: ntp.tz.set
+              fields:
+                - text: { label: "IANA name", field: tz, placeholder: "Europe/Berlin" }
       - text: { label: "NTP Server", key: "s.ntp.server" }
-
-# Browser-side UI registration (parallel to init:) — auto-wired into the
-# buildable SPA via straddles.gen.ts when spangap-web stages the shell. Replaces
-# the hand-maintained registerNetwork() that used to live in spangap-web's own
-# boot/modules.ts (the shell no longer reaches into s.net.* keys).
-browser_register:
-  - call: registerNet
-    module: modules/net

@@ -248,21 +248,18 @@ error removes the partial file.
 
 ## Browser & on-device UI
 
-`net` ships its own front ends — it is not firmware-only:
+`net` ships its own settings — it is not firmware-only:
 
-- **Browser:** `modules/net.ts` registers the **Settings → Internet → WiFi**
-  panel (`NetworkPanel.vue` + `WifiScanDialog.vue`): enable toggle, live STA/AP
-  status, a draggable list of known networks with per-network DHCP/static-IP and
-  custom-MAC editing, a scan dialog, and AP configuration. Wired in
-  automatically via the `browser_register: registerNet` hook when spangap-web
-  stages the SPA shell.
-- **On-device (LVGL):** when [spangap-lcd](../../spangap-lcd) is staged,
-  `net_lcd.cpp` registers **Settings → Internet → WiFi** — enable + live status,
-  a join/delete list of saved networks, a scan picker, and SSID/password entry,
-  so a browserless device can still get onto a network. Per-network static-IP /
-  custom-MAC editing stays browser-only.
-- The **mDNS** and **System** (hostname / timezone / NTP server) panes are
-  generated from the straddle's declarative `settings:` block, not hand-written.
+- **WiFi, mDNS and System** are all described by the `settings:` block in
+  `straddle.yaml`, which the build lowers to the browser and to the display. The
+  same enable toggle, live status, known-network list (reorderable, with
+  per-network DHCP/static-IP and custom-MAC editing), scan-and-adopt picker and
+  access-point configuration appear on both — a browserless device can do
+  everything a browser can.
+- Nothing about them is hand-written on either side. The known networks are a
+  collection whose every mutation goes through a `wifi.net.*` sentinel, and net
+  publishes the state, the signal quality and the scan rows as finished text —
+  see [net-internals](net-internals.md#8-front-ends).
 
 ## Read next
 

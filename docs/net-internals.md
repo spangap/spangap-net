@@ -4,7 +4,7 @@ Maintainer reference for the `net` task. The [operator guide](net.md) covers the
 config surface and the integration points; this document is for changing the
 code without breaking it. Source: [src/net.cpp](../esp-idf/src/net.cpp),
 [include/net.h](../esp-idf/include/net.h), [src/wget.cpp](../esp-idf/src/wget.cpp),
-and the LCD pane [conditional/spangap-lcd/src/net_lcd.cpp](../esp-idf/conditional/spangap-lcd/src/net_lcd.cpp).
+and the settings block in [straddle.yaml](../straddle.yaml), which the build lowers to both UI surfaces.
 
 ## 1. What this function provides
 
@@ -234,16 +234,47 @@ HTTP-client wrapper on the platform; acme/duckdns/ota/viewer each call
   candidate for code removal under the no-config-migrations policy; don't grow
   new migration branches in it.
 
-## 8. Front ends
+## 8. Settings
 
-- **Browser** (`browser/src/`): `modules/net.ts` → `registerNet()` builds the
-  Settings → Internet menu and registers `NetworkPanel.vue` (which embeds
-  `WifiScanDialog.vue`). All known-network edits go through the array
-  (`device.sendJson({s:{net:{wifi:{nets}}}})`); connect/disconnect/scan use the
-  `wifi.*` ephemeral keys.
-- **LCD** (`conditional/spangap-lcd/src/net_lcd.cpp`): `netLcdRegister()` →
-  `lcdRegisterSettings("Internet/WiFi", …)`. Compiled only when spangap-lcd is
-  staged; invoked via the `when:`-gated `netLcdRegister` init hook. It drives the
-  same `wifi.connect` / `wifi.cmd.add` / `wifi.cmd.del` paths as the browser, and
-  nulls its LVGL pointers on pane delete so a late storage callback can't touch
-  freed objects.
+There are no hand-written ones. The `settings:` block in `straddle.yaml`
+describes WiFi, mDNS and System, and the build lowers each to the browser tree,
+the on-device tree and the storage defaults.
+
+The known networks are a **collection**, which is where the interesting part
+lives. The UI never writes `s.net.wifi.nets`; it writes `wifi.net.add` / `.set`
+/ `.remove` / `.order` / `.connect`, and the net task is the array's only writer.
+That is what makes one description enough for both surfaces:
+
+- **Identity.** Each entry carries a small opaque `id` handed out on add
+  (`staNetNextId`) and kept across reorders and deletes, because the collection
+  addresses items by it and every index is invalidated by the removals it would
+  otherwise name. `staNetEnsureIds()` backfills a store written before ids
+  existed. `wifi.connect` still takes an index — the sentinel translates.
+- **Validation** is `staNetRejection()`, one function, and its verdict reaches
+  the operator as text on `wifi.net.error`. A manual IP without a netmask is
+  refused there rather than by a rule written twice in two UIs.
+- **Order** is a preference permutation (`staNetOrder`): recognized ids move
+  into the stated relative order, unknown ids are ignored, unmentioned ids keep
+  their place. A drag is therefore idempotent and safe against a racing add,
+  which is what lets the browser hold an optimistic order until the array
+  re-publishes.
+- **Status** is `staNetPublishStatus()`: one packed `"text|colour"` per known
+  network under `wifi.netstat.<id>`. Which network is connected and which are
+  merely in range is something only this task knows, so it says so in finished
+  words instead of leaving each surface to cross-reference the scan cache.
+- **Candidates** are `wifi.scanned`, which `publishScanResults()` now writes with
+  a `name` and a `detail` line (bars, dBm, lock marker) already rendered — so no
+  surface has to know that an empty SSID means hidden or which dBm deserves which
+  bars. Leaving the pane clears `wifi.scan`, which is the whole "stop scanning on
+  leave" contract.
+
+`publishWifiStatus()` likewise publishes `wifi.sta.state_text`,
+`wifi.sta.signal` and `wifi.traffic` — the state, the signal quality and the
+byte counters as the sentences the rows show. `wifi.ap.enabled` is the plain
+truthy gate for the access-point rows, since `s.net.wifi.ap.active_for` is a
+value (-1 off, 0 until a known network, N idle seconds) and not a flag.
+
+The **timezone** is the one setting whose options are device data: the zone list
+is a file the browser refreshes from upstream, far too large for a descriptor, so
+the row is a form over `s.ntp.tz.set` and `ntpTzSentinel()` checks the name
+resolves against the on-disk DB before storing it.

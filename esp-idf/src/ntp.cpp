@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cctype>
 #include <string>
 #include <time.h>
 #include <sys/time.h>
@@ -143,6 +144,45 @@ static bool zoneLookup(const char* iana, char* out, size_t outLen) {
     snprintf(out, outLen, "%s", node->valuestring);
   cJSON_Delete(root);
   return out[0] != '\0';
+}
+
+/* The timezone as a form over a sentinel.
+ *
+ * The zone list is device data — a 600-entry file the browser refreshes from
+ * upstream — so it cannot be a static option list in a settings descriptor, and
+ * a bare text field would take "Europe/Athens " or "CET" without a word. The
+ * form submits the name here, this checks it against the on-disk DB, and a
+ * miss comes back as a sentence on ntp.tz.set.error. That is the same
+ * submit-and-error shape every other validated setting uses, and it is why a
+ * zone the device cannot resolve can no longer be stored. */
+static void ntpTzSentinel(const char* key, const char* val) {
+  if (strcmp(key, "ntp.tz.set") != 0 || !val || !*val) return;
+  cJSON* o = cJSON_Parse(val);
+  cJSON* m = o ? cJSON_GetObjectItem(o, "tz") : nullptr;
+  std::string want = (cJSON_IsString(m) && m->valuestring) ? m->valuestring : "";
+  if (o) cJSON_Delete(o);
+  storageUnset(key);
+
+  while (!want.empty() && isspace((unsigned char)want.front())) want.erase(0, 1);
+  while (!want.empty() && isspace((unsigned char)want.back()))  want.pop_back();
+  if (want.empty()) { storageSet("ntp.tz.set.error", "A timezone name is required."); return; }
+
+  char posix[64];
+  if (!zoneLookup(want.c_str(), posix, sizeof(posix))) {
+    storageSet("ntp.tz.set.error",
+               ("No such timezone: \"" + want + "\". Use an IANA name, e.g. Europe/Berlin.").c_str());
+    return;
+  }
+  storageBegin();
+  storageSet("s.ntp.tz", want.c_str());
+  storageSet("s.ntp.posix", posix);
+  storageEnd();
+  /* Accepted: the form closes on the bump. A monotonic per-boot counter, not a
+   * read-increment — reads see the committed tree, and the actor may not have
+   * applied the previous bump yet. */
+  static int ack = 0;
+  storageSet("ntp.tz.set.done", ++ack);
+  ntpApplyTimezone();
 }
 
 void ntpApplyTimezone() {
@@ -291,6 +331,12 @@ void ntpInit() {
     storageSet("s.ntp.version", NTP_VERSION);
     storageEnd();
   }
+
+  /* The settings timezone form submits here; this is the only writer of
+   * s.ntp.tz that checks the name resolves before storing it. The sentinel is
+   * an ephemeral key BESIDE the value, never a child of it — a dot-path write
+   * under a scalar key replaces the scalar with an object, destroying it. */
+  storageSubscribeChanges("ntp.tz.set", ntpTzSentinel);
 
   /* Fire updateTimeValid() on every successful background SNTP sync — the
    * automatic poll calls settimeofday() inside lwIP, which we'd otherwise
