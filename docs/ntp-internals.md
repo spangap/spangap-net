@@ -8,8 +8,8 @@ config surface. Source: [src/ntp.cpp](../esp-idf/src/ntp.cpp),
 
 - **A reconciled SNTP engine** — `esp_sntp` started/stopped from one place,
   driven by upstream state AND an inhibit flag.
-- **The IANA→POSIX timezone resolver** with a transient parse of an on-disk DB
-  and a cached result.
+- **The IANA→POSIX timezone resolver** over the firmware's built-in zone
+  table.
 - **The GPS-inhibit hand-off** over a storage key, with no compile-time coupling.
 - **Browser time-push** (`sys.time.set`) and the `sys.time.valid` telemetry.
 - **The `date` / `date wait` CLI.**
@@ -34,23 +34,33 @@ in `ntpEngineApply` is `static` to avoid a dangling pointer.
 `ntpInit()` runs on the auto-init dispatcher (main_task), which **self-deletes
 when `app_main` returns**. A `storageSubscribeChanges` registered there would be
 orphaned — the callback never fires, and storage logs a "notify drop" into the
-freed TCB. So the `sys.time.ext` subscription is registered **lazily in
-`ntpOnPoll`**, on the net task (which lives and polls), guarded by a `static
-bool subDone`. It also applies the current `sys.time.ext` value once at that
-point, in case a clock authority claimed it before net came up. Anything that
-must outlive `app_main` goes here, not in `ntpInit()`.
+freed TCB. So every subscription this module owns — `sys.time.ext`, the
+`ntp.tz.set` form sentinel, the `ntp.sync.now` button sentinel — is registered
+**lazily in `ntpOnPoll`**, on the net task (which lives and polls), guarded by a
+`static bool subDone`. That also puts the handlers in the one context allowed
+to touch the SNTP engine and to run the file-parsing zone resolve. The
+`sys.time.ext` value is applied once at registration, in case a clock authority
+claimed it before net came up. Anything that must outlive `app_main` goes here,
+not in `ntpInit()`.
 
 ## 4. Timezone resolver
 
+`applyTz()` is the only writer of the `TZ` env var, and it is only ever fed a
+**resolved POSIX string** — never a raw IANA name, which newlib cannot parse
+and which would therefore mean silent UTC.
+
 `ntpApplyTimezone()` reads `s.ntp.tz` (IANA). If empty it early-exits, leaving
-`TZ` unset → UTC. It prefers the cached `s.ntp.posix`; on a miss it calls
-`zoneLookup()`, which reads `<stateDir>/timezones.json` into a PSRAM buffer
-(falling back to `gp_alloc`), parses it with cJSON, walks the `/`-separated IANA
-path down the nested objects (so `America/Argentina/Buenos_Aires` descends three
-levels), pulls the one string, and **frees the whole cJSON tree before
-returning** — nothing of the ~15 KB map survives the call. The result is cached
-back into `s.ntp.posix`. `ntpOnCfg` clears `s.ntp.posix` whenever `s.ntp.tz`
-changes so the new zone re-resolves.
+`TZ` unset → UTC. It resolves via `tzLookup()` (spangap-core `timezones.h`): a
+binary search over two strcmp-sorted rodata arrays generated at release time —
+no file, no parse, no RAM, and therefore no cache to invalidate. On a hit it
+calls `applyTz()`; on a miss the currently applied `TZ` is kept and a warning
+logged — a name the table lacks must never tear down a working timezone, and a
+later firmware whose table gained the zone resolves it on that boot.
+
+`ntpOnCfg` on `s.ntp.tz` just calls `ntpApplyTimezone()` — the browser writes
+`s.ntp.tz` directly on first connect; the settings form goes through the
+validating `ntp.tz.set` sentinel instead, which rejects unresolvable names
+outright.
 
 `ntpInit()` ends by calling `updateTimeValid()` then `ntpApplyTimezone()`, so the
 auto-init dispatcher runs NTP end-to-end with no consumer call site — log lines
@@ -62,7 +72,9 @@ switch from UTC to local from that point.
 VALID_EPOCH`. `updateTimeValid()` publishes `sys.time.valid`. It's called on:
 the registered SNTP sync-notification callback (`ntpSyncNotify`, which runs on
 the tcpip task after a background poll sets the clock), the `date` set path, and
-init.
+init. `ntpSyncNotify` additionally publishes `ntp.last_sync`, a finished
+local-time string for the settings pane's "Last NTP sync" row — the visible
+effect of the sync-now button.
 
 `ntpOnCfg` handles `sys.time.set`: it accepts a browser-pushed epoch only if the
 clock isn't already valid (NTP wins when present), calls `settimeofday`, and
@@ -73,7 +85,16 @@ clears the key.
 - **All SNTP start/stop must stay on the net task.** `ntpEngineApply` is only
   ever reached from net-task callbacks; calling `esp_sntp_init`/`stop` from
   another task races the engine. `ntpInhibit` is the cross-task entry — it sets a
-  flag, nothing more.
+  flag, nothing more. The `ntp.sync.now` sentinel (`esp_sntp_restart` is a
+  stop+init) is safe only because its subscription is registered from the net
+  task.
+- **Never setenv an unresolved zone name.** `TZ` takes POSIX strings; newlib
+  quietly falls back to UTC on anything else. All writes go through
+  `applyTz()`, which is only fed `tzLookup()` output.
+- **The zone table has exactly one refresh channel: `make timezones` +
+  release.** There is no on-device zone file and no runtime upload — do not
+  reintroduce one; stale zone data is fixed by shipping firmware, which
+  happens far more often than IANA rule changes.
 - **The timezone map must not enter the config tree.** It's a loose file by
   design; keep it parsed transiently and freed. Holding it resident defeats the
   whole reason it lives outside `cfgRoot`.

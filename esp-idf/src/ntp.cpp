@@ -6,9 +6,8 @@
  */
 #include "ntp.h"
 #include "spangap.h"
-#include "mem.h"
 #include "storage.h"
-#include "fs.h"
+#include "timezones.h"
 #include "net.h"
 #include "cli.h"
 #include "pm.h"
@@ -22,13 +21,14 @@
 #include <time.h>
 #include <sys/time.h>
 #include "esp_sntp.h"
-#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 static const time_t VALID_EPOCH = 1735689600;  /* 2025-01-01 00:00:00 UTC */
+
+static void applyTz(const char* iana, const char* posix);
 
 static bool timeValid() { return time(nullptr) >= VALID_EPOCH; }
 
@@ -56,6 +56,15 @@ static void updateTimeValid() {
  * react without polling. Runs on the tcpip task context. */
 static void ntpSyncNotify(struct timeval*) {
   updateTimeValid();
+  /* Finished local-time string for the settings "Last NTP sync" row (and the
+   * visible effect of the sync-now button). Ephemeral: absent until the first
+   * sync of a boot. */
+  time_t now = time(nullptr);
+  struct tm tm;
+  localtime_r(&now, &tm);
+  char buf[24];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+  storageSet("ntp.last_sync", buf);
 }
 
 /* ---- NTP start/stop ----
@@ -95,64 +104,13 @@ void ntpInhibit(bool inhibit) {
   s_inhibited = inhibit;   /* net task reconciles on its next poll (≤~10 ms) */
 }
 
-/* Resolve the POSIX TZ string for an IANA name from the on-disk timezone DB.
- *
- * The IANA→POSIX map is large (~15 KB JSON, hundreds of zones) and is needed
- * only on the rare timezone change, so it deliberately does NOT live in the
- * config tree (cfgRoot) — that would keep it resident in RAM for the whole
- * runtime. It's a plain file at <stateDir>/timezones.json (the browser
- * refreshes it via an HTTPS PUT when GitHub's copy is newer). We parse it
- * transiently here, pull the one string we need, and free the cJSON tree
- * before returning — so nothing of it survives the call.
- *
- * Returns true and fills `out` on success; false if the file or zone is
- * missing. `iana` is split on '/' (e.g. "America/Argentina/Buenos_Aires"
- * descends three object levels). */
-static bool zoneLookup(const char* iana, char* out, size_t outLen) {
-  out[0] = '\0';
-  std::string path = fsStatePath("/timezones.json");
-  int fd = fs_open(path.c_str(), "rb");
-  if (fd < 0) return false;
-  fs_seek(fd, 0, SEEK_END);
-  long sz = fs_tell(fd);
-  fs_seek(fd, 0, SEEK_SET);
-  if (sz <= 0 || sz > 256 * 1024) { fs_close(fd); return false; }
-  char* buf = (char*)heap_caps_malloc(sz + 1, MALLOC_CAP_SPIRAM);
-  if (!buf) buf = (char*)gp_alloc(sz + 1);
-  if (!buf) { fs_close(fd); return false; }
-  size_t rd = fs_read(buf, 1, sz, fd);
-  fs_close(fd);
-  buf[rd] = '\0';
-
-  cJSON* root = cJSON_Parse(buf);
-  free(buf);
-  if (!root) return false;
-
-  /* Walk the '/'-separated IANA path down the nested objects. */
-  cJSON* node = root;
-  std::string part;
-  for (const char* p = iana; node; p++) {
-    if (*p == '/' || *p == '\0') {
-      node = cJSON_GetObjectItemCaseSensitive(node, part.c_str());
-      part.clear();
-      if (*p == '\0') break;
-    } else {
-      part += *p;
-    }
-  }
-  if (cJSON_IsString(node) && node->valuestring)
-    snprintf(out, outLen, "%s", node->valuestring);
-  cJSON_Delete(root);
-  return out[0] != '\0';
-}
-
 /* The timezone as a form over a sentinel.
  *
- * The zone list is device data — a 600-entry file the browser refreshes from
- * upstream — so it cannot be a static option list in a settings descriptor, and
+ * The zone list is the firmware's built-in table (timezones.h) — hundreds of
+ * entries, so it cannot be a static option list in a settings descriptor, and
  * a bare text field would take "Europe/Athens " or "CET" without a word. The
- * form submits the name here, this checks it against the on-disk DB, and a
- * miss comes back as a sentence on ntp.tz.set.error. That is the same
+ * form submits the name here, this checks it against the table, and a miss
+ * comes back as a sentence on ntp.tz.set.error. That is the same
  * submit-and-error shape every other validated setting uses, and it is why a
  * zone the device cannot resolve can no longer be stored. */
 static void ntpTzSentinel(const char* key, const char* val) {
@@ -167,47 +125,56 @@ static void ntpTzSentinel(const char* key, const char* val) {
   while (!want.empty() && isspace((unsigned char)want.back()))  want.pop_back();
   if (want.empty()) { storageSet("ntp.tz.set.error", "A timezone name is required."); return; }
 
-  char posix[64];
-  if (!zoneLookup(want.c_str(), posix, sizeof(posix))) {
+  const char* posix = tzLookup(want.c_str());
+  if (!posix) {
     storageSet("ntp.tz.set.error",
                ("No such timezone: \"" + want + "\". Use an IANA name, e.g. Europe/Berlin.").c_str());
     return;
   }
-  storageBegin();
   storageSet("s.ntp.tz", want.c_str());
-  storageSet("s.ntp.posix", posix);
-  storageEnd();
   /* Accepted: the form closes on the bump. A monotonic per-boot counter, not a
    * read-increment — reads see the committed tree, and the actor may not have
    * applied the previous bump yet. */
   static int ack = 0;
   storageSet("ntp.tz.set.done", ++ack);
-  ntpApplyTimezone();
+  applyTz(want.c_str(), posix);
+}
+
+/* The one place TZ is written. Only ever fed a resolved POSIX string — never
+ * a raw IANA name, which newlib can't parse and would silently mean UTC. */
+static void applyTz(const char* iana, const char* posix) {
+  setenv("TZ", posix, 1);
+  tzset();
+  info("timezone: %s → %s\n", iana, posix);
 }
 
 void ntpApplyTimezone() {
   char iana[48];
   storageGetStr("s.ntp.tz", iana, sizeof(iana));
   if (!iana[0]) return;
+  const char* posix = tzLookup(iana);
+  if (posix)
+    applyTz(iana, posix);
+  else
+    /* Keep whatever TZ is currently applied; a table that gains the zone in
+     * a later firmware resolves it on that boot. */
+    warn("timezone: %s not in the built-in zone table — keeping current TZ\n", iana);
+}
 
-  /* Primary: cached POSIX string from a previous resolve (tiny, lives in
-   * config). Invalidated by ntpOnCfg() whenever s.ntp.tz changes. */
-  char posix[64];
-  storageGetStr("s.ntp.posix", posix, sizeof(posix));
-
-  /* Fallback: resolve from the on-disk timezone DB, then cache the result so
-   * subsequent boots skip the file parse. */
-  if (!posix[0] && zoneLookup(iana, posix, sizeof(posix)))
-    storageSet("s.ntp.posix", posix);
-
-  if (posix[0]) {
-    setenv("TZ", posix, 1);
-    tzset();
-    info("timezone: %s → %s\n", iana, posix);
+/* "Sync time now" button (settings System pane) writes this sentinel. Runs on
+ * the net task — registered in ntpOnPoll — which is the only context allowed
+ * to poke the SNTP engine, so esp_sntp_restart() (a stop+init) is safe here. */
+static void ntpSyncNowSentinel(const char* key, const char* val) {
+  /* The button writes with edge semantics (0 first, then 1) — only the 1 is
+   * the press; the 0 and our own storageUnset echo must not retrigger. */
+  if (strcmp(key, "ntp.sync.now") != 0 || !val || atoi(val) == 0) return;
+  storageUnset(key);
+  if (s_running) {
+    esp_sntp_restart();
+    info("ntp: immediate sync requested\n");
   } else {
-    setenv("TZ", iana, 1);
-    tzset();
-    info("timezone: %s (no POSIX mapping)\n", iana);
+    warn("ntp: sync requested but engine is stopped (%s)\n",
+         s_inhibited ? "GPS owns time" : "no upstream");
   }
 }
 
@@ -227,6 +194,12 @@ static void ntpOnPoll(const char*) {
     subDone = true;
     storageSubscribeChanges("sys.time.ext", ON_CHANGE { ntpInhibit(atoi(val) != 0); });
     ntpInhibit(storageGetInt("sys.time.ext", 0) != 0);
+    /* The settings sentinels live here too, and for the same reason: a
+     * subscription from ntpInit() dies with main_task. Registering on the net
+     * task also puts both handlers in the one context that may touch the SNTP
+     * engine and do the (file-parsing) zone resolve. */
+    storageSubscribeChanges("ntp.tz.set", ntpTzSentinel);
+    storageSubscribeChanges("ntp.sync.now", ntpSyncNowSentinel);
   }
   ntpEngineApply();
 }
@@ -235,10 +208,11 @@ static void ntpOnPoll(const char*) {
 
 static void ntpOnCfg(const char* key) {
   if (strcmp(key, "s.ntp.tz") == 0) {
-    /* Drop the stale POSIX cache so ntpApplyTimezone() re-resolves the new
-     * zone from the on-disk DB. The browser now sends only s.ntp.tz; the
-     * device owns the IANA→POSIX lookup. */
-    storageSet("s.ntp.posix", "");
+    /* The browser sends only s.ntp.tz (its first-connect auto-config); the
+     * settings form goes through the validating ntp.tz.set sentinel instead.
+     * ntpApplyTimezone() resolves against the built-in table and touches TZ
+     * only on success, so a name the table lacks never tears down a working
+     * timezone. */
     ntpApplyTimezone();
   } else if (strcmp(key, "sys.time.set") == 0) {
     char buf[16];
@@ -314,29 +288,24 @@ void ntpInit() {
   int v = storageGetInt("s.ntp.version", 0);
   if (v < NTP_VERSION) {
     storageDefaultTree("s.ntp", R"({
-      "server":     "pool.ntp.org",
-      "tz":         "",
-      "posix":      "",
-      "zones_etag": ""
+      "server": "pool.ntp.org",
+      "tz":     ""
     })");
-    /* v1→v2: the IANA→POSIX map moved out of config storage to the loose
-     * file <stateDir>/timezones.json. On an OTA upgrade the legacy external
+    /* v1→v2: the IANA→POSIX map is compiled into the firmware (timezones.h),
+     * never config storage. On an OTA upgrade from v1 the legacy in-config
      * blob is still on disk and scanExternals() would keep it resident in
-     * cfgRoot forever — evict it so the map is truly out of RAM. The new
-     * loose file ships via the factory image / browser PUT. No-op when the
-     * key is absent (e.g. fresh devices). The cached s.ntp.posix from v1
-     * survives, so TZ stays applied even before the new file arrives. */
+     * cfgRoot forever — evict it. No-op when the key is absent. */
     storageBegin();
     if (v < 2) storageDeleteTree("s.time.zones");
     storageSet("s.ntp.version", NTP_VERSION);
     storageEnd();
   }
 
-  /* The settings timezone form submits here; this is the only writer of
-   * s.ntp.tz that checks the name resolves before storing it. The sentinel is
-   * an ephemeral key BESIDE the value, never a child of it — a dot-path write
-   * under a scalar key replaces the scalar with an object, destroying it. */
-  storageSubscribeChanges("ntp.tz.set", ntpTzSentinel);
+  /* The ntp.tz.set / ntp.sync.now sentinels are registered lazily in
+   * ntpOnPoll, on the net task — a subscription from here would be orphaned
+   * when main_task self-deletes (see §3 of ntp-internals). The sentinels are
+   * ephemeral keys BESIDE their values, never children of them — a dot-path
+   * write under a scalar key replaces the scalar with an object. */
 
   /* Fire updateTimeValid() on every successful background SNTP sync — the
    * automatic poll calls settimeofday() inside lwIP, which we'd otherwise

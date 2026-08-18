@@ -52,8 +52,8 @@ settings:
       - { id: net, label: "WiFi & Network", short: "Network", order: 10 }
       - { id: wifi, label: "WiFi", short: "WiFi", order: 1 }
     rows:
-      - switch: { label: "Enable", key: "s.net.wifi.enable" }
-      - section: "Status"
+      - section: "WiFi Settings"
+      - switch: { label: "Enable WiFi", key: "s.net.wifi.enable" }
       # Every row here is a string net.cpp publishes finished — the state and
       # the signal quality in words, the traffic pair as one line.
       - info:
@@ -86,7 +86,7 @@ settings:
           orderable: true
           cmd: wifi.net
           add:
-            - label: "Add network"
+            - label: "Add manually"
               form:
                 title: "Add network"
                 submit: "Add"
@@ -94,33 +94,44 @@ settings:
                   - text: { label: "Network name", field: ssid }
                   - text: { label: "Password", field: pass, secret: true, placeholder: "leave empty if open" }
           remove: { confirm: "Forget {ssid}?" }
+          # Joining is worth offering on every known network except the one we
+          # are already on; net.cpp publishes that as a gate rather than the
+          # surfaces comparing the connected SSID against the item.
           actions:
-            - { label: "Connect", do: { set: { key: "wifi.net.connect", value: "{id}" } } }
+            - label: "Connect"
+              when_key: "wifi.netjoinable.{id}"
+              do: { set: { key: "wifi.net.connect", value: "{id}" } }
+          # The item's detail page. Opened by tapping the row, and it carries the
+          # Connect and Delete buttons too, so the row itself is just the network.
+          # The SSID names the page rather than sitting on it: it is what the
+          # entry IS, and nothing here changes it. A field left out of `edit:`
+          # is not edited — net.cpp carries it forward on `.set` — so leaving it
+          # out is how a detail page says "not this".
           edit:
-            - text:   { label: "Network name", field: ssid }
+            - section: "{ssid}"
             - text:   { label: "Password", field: pass, secret: true }
-            - section: "Address"
-            - caption: "Leave the IP blank for DHCP."
-            - text: { label: "IP", field: ip }
+            - text: { label: "Fixed IP", field: ip, placeholder: "DHCP" }
             - text: { label: "Netmask", field: mask, default: "255.255.255.0" }
               when_key: "{ip}"
             - text: { label: "Gateway", field: gw }
               when_key: "{ip}"
             - text: { label: "DNS", field: dns }
               when_key: "{ip}"
-            - section: "Hardware address"
-            - text: { label: "MAC", field: mac, placeholder: "blank = this device's own" }
+            # The hint is the MAC this device would actually use, which only the
+            # firmware knows — hence the key rather than a literal.
+            - text: { label: "MAC", field: mac, placeholder_key: "wifi.mac" }
           # Scan-and-adopt. net.cpp renders each result's two lines (name, and
           # bars + dBm + lock marker) so neither surface draws signal strength.
           candidates:
             key: wifi.scanned
             item: "{name}"
             subtitle: "{detail}"
+            found: "Found networks"
             refresh: { label: "Scan for networks", do: { set: { key: "wifi.scan", value: "1", edge: true } } }
-      - section: "Access point"
-      - caption: "The fallback way in. 0 keeps it up until a known network appears; a number of seconds shuts it down after that much idle time, once per boot."
+      - section: "Access Point"
+      - caption: "Becomes AP when no known networks found. 0 keeps it up until a known network appears; a number of seconds shuts it down after that much idle time."
       - slider: { label: "Active for (s)", key: "s.net.wifi.ap.active_for", min: -1, max: 3600 }
-      - caption: "-1 disables the access point. With no other network configured that makes this device unreachable."
+      - caption: "-1 disables the Access Point."
       - text: { label: "SSID", key: "s.net.wifi.ap.ssid" }
         when_key: wifi.ap.enabled
       - text: { label: "Password", key: "s.net.wifi.ap.pass" }
@@ -147,10 +158,12 @@ settings:
       - section: "This System"
       - text: { label: "Hostname", key: "s.net.hostname" }
       - section: "Time & Date"
-      # The zone list is device data (a 600-entry file the browser refreshes),
-      # so it cannot be a static option list here. The form submits a name and
-      # ntp.cpp checks it resolves before storing it — a miss comes back as a
-      # sentence rather than being silently accepted.
+      # The zone list is too long to be a static option list, so the picker is
+      # the optionless `timezone:` field: each surface brings its own list
+      # (the browser its Intl database, the LCD the firmware's built-in zone
+      # table). The form still submits the name through ntp.tz.set and
+      # ntp.cpp checks it resolves against that table before storing it — a
+      # miss comes back as a sentence rather than being silently accepted.
       - value: { label: "Timezone", key: "s.ntp.tz" }
       - button:
           label: "Set timezone"
@@ -160,5 +173,12 @@ settings:
               submit: "Set"
               cmd: ntp.tz.set
               fields:
-                - text: { label: "IANA name", field: tz, placeholder: "Europe/Berlin" }
+                - timezone: { label: "Timezone", field: tz, placeholder_key: "s.ntp.tz" }
       - text: { label: "NTP Server", key: "s.ntp.server" }
+      - value: { label: "Last NTP sync", key: "ntp.last_sync" }
+      # Edge write: the sentinel clears itself after handling, but a press
+      # that raced an earlier one must still register as a change.
+      - button:
+          label: "Sync time now"
+          do:
+            set: { key: "ntp.sync.now", value: "1", edge: true }

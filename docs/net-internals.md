@@ -123,6 +123,11 @@ at the RNS-reconnect cadence. The dial fd reuses a `netClients` slot with
 
 ## 4. WiFi state machine
 
+`wifiNetifInit()` opens with a `logRule("Password length matches WPA2 standards",
+'I')`. `esp_wifi` emits that at `W` on every STA config write, and it is not a
+warning: a WPA2-length passphrase raising the authmode threshold off OPEN is what
+having a passphrase means. The line is kept, at the level it is worth.
+
 `ST_SCANNING` calls `scanForKnown()` (active scan, match against
 `s.net.wifi.nets[]`); a match gets `WIFI_CONNECT_RETRIES` (3) attempts before AP
 fallback, so one slow DHCP doesn't bump the user off their network. `ST_AP`

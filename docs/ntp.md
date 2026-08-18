@@ -26,12 +26,18 @@ also flips it.
 
 **Timezone.** `s.ntp.tz` holds an IANA name (e.g. `America/Argentina/Buenos_Aires`).
 `ntp` resolves it to a POSIX `TZ` string and applies it, so log timestamps and
-`localtime` show local time. The resolution comes from the on-disk timezone DB
-at `<stateDir>/timezones.json` (a ~15 KB map kept out of the config tree / RAM,
-parsed only on a timezone change), and the resolved string is cached in
-`s.ntp.posix` to skip the parse on later boots. On a fresh device, before the
-browser sends a timezone, `TZ` is unset and times are **UTC** — there is no
-default-timezone guess.
+`localtime` show local time. Resolution is a binary search over the firmware's
+**built-in zone table** (`timezones.h` in spangap-core: two strcmp-sorted
+rodata arrays, generated at release time by `make timezones` and checked in) —
+nothing is read from disk, parsed, or held in RAM, and zone data refreshes
+with every firmware update. On a fresh device, before the browser sends a
+timezone, `TZ` is unset and times are **UTC** — there is no default-timezone
+guess.
+
+Resolution is fail-safe: a name the table cannot resolve never reaches `TZ`
+(newlib cannot parse an IANA name, which would mean silent UTC) — the working
+timezone stays applied and the miss is a warning. A later firmware whose table
+gained the zone resolves it on that boot.
 
 ## How others integrate
 
@@ -54,17 +60,21 @@ default-timezone guess.
 |---|---|---|
 | `s.ntp.server` | `pool.ntp.org` | NTP server hostname (DNS must be reachable). |
 | `s.ntp.tz` | `""` | IANA timezone name. Empty → UTC. |
-| `s.ntp.posix` | `""` | Cached POSIX `TZ` string resolved from `s.ntp.tz`; cleared automatically when `s.ntp.tz` changes. |
-| `s.ntp.zones_etag` | `""` | ETag of the on-disk timezone DB (the browser refreshes the file when GitHub's copy is newer). |
 
 The hostname / timezone / NTP-server fields surface in the generated **System**
-settings pane (the web leaf keeps a searchable timezone picker).
+settings pane. The timezone is a `timezone:` form field behind the validating
+`ntp.tz.set` sentinel: the browser renders it as a type-to-filter picker over
+its own Intl zone list, the LCD as region + zone dropdowns over the built-in
+zone table — the yaml states no list and neither surface fetches the other's.
+The pane also carries a **Sync time now** button (the `ntp.sync.now` sentinel)
+and a **Last NTP sync** row (`ntp.last_sync`).
 
 ### Runtime (ephemeral)
 
 | Key | Meaning |
 |---|---|
 | `sys.time.valid` | `1` once the clock is past 2025-01-01. |
+| `ntp.last_sync` | Local-time string of the last successful SNTP sync this boot. |
 
 ### Command sentinels (read, self-clearing)
 
@@ -72,6 +82,8 @@ settings pane (the web leaf keeps a searchable timezone picker).
 |---|---|
 | `sys.time.set` | `<epoch>` sets the clock if it isn't already valid (then cleared). |
 | `sys.time.ext` | `1` inhibits SNTP (a local clock owns time), `0` releases it. |
+| `ntp.tz.set` | `{"tz": "<IANA name>"}` — validates against the built-in zone table, stores `s.ntp.tz`, applies. Answers on `ntp.tz.set.error` / `.done`. |
+| `ntp.sync.now` | Truthy write forces an immediate SNTP poll (`esp_sntp_restart`); a warning is logged if the engine is stopped. |
 
 ## CLI
 

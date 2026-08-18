@@ -694,6 +694,12 @@ static void wifi_event_handler(void* arg, esp_event_base_t base,
 /* ---- WiFi helpers ---- */
 
 static void wifiNetifInit() {
+  /* esp_wifi warns about this on every single STA config write, and it is not a
+     warning: a WPA2-length passphrase raising the authmode threshold off OPEN is
+     what we asked for by having a passphrase at all. Keep the line, at the level
+     it is worth. */
+  logRule("Password length matches WPA2 standards", 'I');
+
   esp_netif_init();
   esp_event_loop_create_default();
   sta_netif = esp_netif_create_default_wifi_sta();
@@ -850,7 +856,9 @@ static void staNetWrite(int idx, const std::string& id,
 }
 
 /** The fields of a `wifi.net.add` / `.set` payload, which is the form's field
- *  object as JSON. Absent members read as empty, which is what erases them. */
+ *  object as JSON. Only members the payload actually carries land in the map, so
+ *  a caller can tell "left blank" (present, empty — erase it) from "not offered"
+ *  (absent), which `staNetSetJson` carries forward. */
 static std::map<std::string, std::string> staNetParse(const char* json, std::string* idOut) {
   std::map<std::string, std::string> out;
   cJSON* o = cJSON_Parse(json);
@@ -887,12 +895,23 @@ static void staNetAddJson(const char* json) {
   storageSet("wifi.connect", v);
 }
 
-/** Commit an item editor's fields against the entry it names. */
+/** Commit an item editor's fields against the entry it names.
+ *
+ *  ABSENT is not EMPTY. A field the editor carries and left blank arrives as an
+ *  empty string and erases what was there — that is how a fixed IP is handed
+ *  back to DHCP. A field the editor does not carry at all is not being edited,
+ *  so it is filled in from the entry before anything is judged or written. The
+ *  detail page shows the SSID in its heading rather than as a row, and without
+ *  this every Save from it would erase the SSID and then be rejected for having
+ *  none. */
 static void staNetSetJson(const char* json) {
   std::string id;
   auto f = staNetParse(json, &id);
   int idx = staNetFindById(id.c_str());
   if (idx < 0) { staNetError("That network is no longer configured."); return; }
+  for (const char* fld : STA_NET_FIELDS)
+    if (strcmp(fld, "id") != 0 && f.find(fld) == f.end())
+      f[fld] = staNetField(idx, fld);
   std::string why = staNetRejection(f["ssid"], f["ip"], f["mask"]);
   if (!why.empty()) { staNetError(why.c_str()); return; }
   storageBegin();
@@ -1268,10 +1287,15 @@ static void publishWifiStatus() {
   staNetPublishStatus();
 }
 
-/** One status pill per known network, as packed "text|colour". Which network is
+/** One status pill per known network, as packed "text|colour", and beside it the
+ *  gate that says whether joining it is a thing to offer. Which network is
  *  connected and which are merely in range is something only this task knows,
  *  and saying it in finished words means neither settings surface has to
- *  cross-reference the scan cache against the configured list. */
+ *  cross-reference the scan cache against the configured list.
+ *
+ *  The gate is published truthy for every network EXCEPT the one we are on, so
+ *  the settings surfaces can hide a Connect button with a truthiness test and
+ *  never a comparison. */
 static bool scanCacheHas(const char* ssid) {
   return ssid && *ssid && scanSeenFind(ssid) != nullptr;
 }
@@ -1285,12 +1309,15 @@ static void staNetPublishStatus() {
     std::string id   = staNetField(i, "id");
     std::string ssid = staNetField(i, "ssid");
     if (id.empty()) continue;
+    bool onIt = !ssid.empty() && ssid == connected;
     const char* pill = "";
-    if (!ssid.empty() && ssid == connected)  pill = "connected|green";
-    else if (scanCacheHas(ssid.c_str()))     pill = "in range|blue";
+    if (onIt)                            pill = "connected|green";
+    else if (scanCacheHas(ssid.c_str())) pill = "in range|blue";
     char k[64];
     snprintf(k, sizeof(k), "wifi.netstat.%s", id.c_str());
     storageSet(k, pill);
+    snprintf(k, sizeof(k), "wifi.netjoinable.%s", id.c_str());
+    storageSet(k, onIt ? 0 : 1);
   }
   storageEnd();
 }
