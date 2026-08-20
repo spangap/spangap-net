@@ -40,7 +40,13 @@ static bool drawNetPage(tinylcd_page_t, u8g2_t* g, tinylcd_ev_t ev)
     /* Five fixed lines in the rows-8..55 window, prefixes aligned at column
      * five: SSID / DNS name / STA IP / AP SSID / AP IP. The DNS line only
      * exists while the network is up — a .local name that resolves nowhere
-     * is noise. */
+     * is noise.
+     *
+     * This page is a ladder rather than tinylcd's title-and-body shape, so it
+     * places its own baselines — but it starts at the same 15 and steps 10,
+     * which puts the first line inside the yellow band of a two-tone panel and
+     * the seam at row 16 in the pitch below it. Re-space the ladder and that
+     * alignment is what to preserve: no line may straddle row 16. */
     char host[32], line[48];
     u8g2_SetFont(g, u8g2_font_6x10_tf);
 

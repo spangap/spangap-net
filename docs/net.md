@@ -93,6 +93,7 @@ Declared in [include/net.h](../esp-idf/include/net.h):
 | `netIsStaConnected()` | True only when associated to an upstream as STA. |
 | `netGetLocalIp(out, len)` | The STA IP, or `""` if not STA-connected. |
 | `netActivity()` | Reset the graceful-shutdown idle timer. |
+| `netMulticastRxAcquire()` / `netMulticastRxRelease()` | Refcounted hold: while held, WiFi modem power-save stays at `WIFI_PS_MIN_MODEM` (wake for every DTIM beacon — when the AP transmits buffered multicast) instead of the default `WIFI_PS_MAX_MODEM`, which sleeps through most multicast. Hold while a service depends on receiving multicast; safe from any task, applied immediately and on every later bring-up. |
 | `netTrafficIn/Out(bytes)` | Add to the traffic counters (for tasks with their own sockets, e.g. WebRTC UDP; net's own relayed TCP is counted automatically). |
 | `netForceClose(itsHandle)` | RST a relayed TCP connection. |
 
@@ -154,6 +155,7 @@ default MAC).
 | `wifi.traffic_in` / `wifi.traffic_out` | Human-formatted byte counters. |
 | `wifi.sta.state` | `off` / `connecting` / `connected`. |
 | `wifi.sta.{ssid,rssi,channel,ip,router,netmask,dns,up}` | STA association detail. |
+| `wifi.sta.ip6` / `wifi.sta.ip6_ll` | Best non-link-local IPv6 address (global scope preferred over unique-local) and the link-local, RFC 5952 text. Empty until SLAAC / duplicate-address detection delivers one; the settings rows hide on empty. IPv6 has no settings: the addresses are always automatic (link-local + SLAAC), so unlike v4 there is no static configuration to offer. |
 | `wifi.ap.state` | `off` / `active`. |
 | `wifi.ap.{ssid,ip,netmask,up}` | AP detail when active. |
 | `wifi.scanned` | JSON array of nearby networks (`{ssid,bssid,rssi,locked}`, strongest first), published while a scan is requested. One row per SSID — when several APs serve the same network only the loudest is listed; hidden (empty-SSID) APs are kept individually. |

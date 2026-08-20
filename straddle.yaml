@@ -69,6 +69,13 @@ settings:
               when_key: wifi.sta.up
             - value: { label: "DNS", key: "wifi.sta.dns" }
               when_key: wifi.sta.up
+            # IPv6 is SLAAC + link-local only — nothing to configure, so the
+            # v6 surface is these two readouts. Gated on the value itself:
+            # the row appears once the address exists.
+            - value: { label: "IPv6", key: "wifi.sta.ip6", copyable: true }
+              when_key: wifi.sta.ip6
+            - value: { label: "IPv6 link-local", key: "wifi.sta.ip6_ll", copyable: true }
+              when_key: wifi.sta.ip6_ll
             - value: { label: "MAC", key: "wifi.mac", copyable: true }
             - value: { label: "Signal", key: "wifi.sta.signal" }
               when_key: wifi.sta.up

@@ -72,6 +72,16 @@ bool netIsStaConnected();
 /** Signal network activity (resets idle timer for graceful shutdown). */
 void netActivity();
 
+/** Multicast-RX hold (refcounted). While any holder is active, WiFi modem
+ *  power-save stays at WIFI_PS_MIN_MODEM (wake for every DTIM beacon — the
+ *  window in which the access point transmits buffered multicast) instead of
+ *  the default WIFI_PS_MAX_MODEM, whose listen-interval sleep drops most
+ *  multicast and delays latency-sensitive UDP. Hold it while a service
+ *  depends on receiving multicast; release when it stops. Safe from any
+ *  task; applies immediately and on every later link bring-up. */
+void netMulticastRxAcquire();
+void netMulticastRxRelease();
+
 /** Accumulate traffic counters (bytes). Only for tasks with their own sockets
  *  (e.g. webrtc UDP) — TCP traffic through net's proxy is counted automatically. */
 void netTrafficIn(uint32_t bytes);

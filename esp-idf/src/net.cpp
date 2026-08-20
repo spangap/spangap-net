@@ -36,6 +36,7 @@
 #include "esp_heap_caps.h"
 #include "esp_random.h"
 #include "esp_mac.h"
+#include <atomic>
 #include <cerrno>
 #include <cctype>
 #include <cstdlib>
@@ -72,6 +73,11 @@ static esp_netif_t* ap_netif = nullptr;
 /* Event-driven connection signaling */
 static SemaphoreHandle_t wifiConnectedSem = nullptr;
 static volatile bool staConnected = false;
+
+/* An IPv6 address reached VALID (GOT_IP6) — the net task republishes the
+ * wifi.sta.ip6* keys on its next pass instead of waiting for the 30 s tick.
+ * SLAAC runs on the router's schedule, well after the v4 bring-up publish. */
+static volatile bool ip6Dirty = false;
 
 /* Set once per boot when sys.boot_complete fires (after every straddle's init
  * hook and the boot script). The net task spins on this — pumping itsPoll so
@@ -679,6 +685,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t base,
     if (memcmp(&lastLogged.addr, &e->ip6_info.ip.addr, sizeof(lastLogged.addr)) == 0)
       return;
     lastLogged = e->ip6_info.ip;
+    ip6Dirty = true;
     const char* scope;
     switch (esp_netif_ip6_get_addr_type(&e->ip6_info.ip)) {
       case ESP_IP6_ADDR_IS_GLOBAL:       scope = "global";     break;
@@ -1175,6 +1182,38 @@ static void publishScanResults() {
 
 static void staNetPublishStatus();
 
+/** The STA netif's IPv6 addresses as display text: `ip6` gets the best
+ *  non-link-local address (global scope preferred over unique-/site-local),
+ *  `ll` the link-local. RFC 5952 compressed lowercase via inet_ntop. Empty
+ *  string = absent — which is also the settings rows' hide gate. */
+static void staIp6Strings(char* ip6, size_t ip6Len, char* ll, size_t llLen) {
+  ip6[0] = '\0';
+  ll[0] = '\0';
+  if (!sta_netif) return;
+  esp_ip6_addr_t addrs[CONFIG_LWIP_IPV6_NUM_ADDRESSES];
+  int n = esp_netif_get_all_ip6(sta_netif, addrs);
+  bool haveGlobal = false;
+  for (int i = 0; i < n; i++) {
+    char buf[INET6_ADDRSTRLEN];
+    if (!inet_ntop(AF_INET6, addrs[i].addr, buf, sizeof(buf))) continue;
+    switch (esp_netif_ip6_get_addr_type(&addrs[i])) {
+      case ESP_IP6_ADDR_IS_LINK_LOCAL:
+        safeStrncpy(ll, buf, llLen);
+        break;
+      case ESP_IP6_ADDR_IS_GLOBAL:
+        safeStrncpy(ip6, buf, ip6Len);
+        haveGlobal = true;
+        break;
+      case ESP_IP6_ADDR_IS_UNIQUE_LOCAL:
+      case ESP_IP6_ADDR_IS_SITE_LOCAL:
+        if (!haveGlobal) safeStrncpy(ip6, buf, ip6Len);
+        break;
+      default:
+        break;
+    }
+  }
+}
+
 /** Publish current WiFi status as ephemeral keys.
  *  wifi.sta.state — "off", "connecting", "connected"
  *  wifi.sta.*     — station info (ssid, ip, router, etc.)
@@ -1233,6 +1272,10 @@ static void publishWifiStatus() {
     esp_netif_get_dns_info(sta_netif, ESP_NETIF_DNS_MAIN, &dns1);
     esp_ip4addr_ntoa(&dns1.ip.u_addr.ip4, dns1s, sizeof(dns1s));
     storageSet("wifi.sta.dns", dns1s);
+    char ip6[INET6_ADDRSTRLEN], ip6ll[INET6_ADDRSTRLEN];
+    staIp6Strings(ip6, sizeof(ip6), ip6ll, sizeof(ip6ll));
+    storageSet("wifi.sta.ip6", ip6);
+    storageSet("wifi.sta.ip6_ll", ip6ll);
     storageSet("wifi.sta.up", 1);
     /* Signal quality as a phrase. Which dBm counts as "Good" is a judgement
      * about this radio, so it is made here rather than by each surface guessing
@@ -1250,6 +1293,8 @@ static void publishWifiStatus() {
     storageSet("wifi.sta.router", "");
     storageSet("wifi.sta.netmask", "");
     storageSet("wifi.sta.dns", "");
+    storageSet("wifi.sta.ip6", "");
+    storageSet("wifi.sta.ip6_ll", "");
     storageSet("wifi.sta.rssi", 0);
     storageSet("wifi.sta.channel", 0);
     storageSet("wifi.sta.up", 0);
@@ -1469,13 +1514,38 @@ static void setDhcpHostname() {
   esp_netif_set_hostname(sta_netif, hostname);
 }
 
+/* ---- multicast-RX hold ----
+ * WIFI_PS_MAX_MODEM wakes only per listen interval and sleeps through the
+ * DTIM beacons after which the access point transmits buffered multicast, so
+ * a station in max power-save receives almost none of it (TCP survives on
+ * retransmission; raw UDP multicast just vanishes). Services that need
+ * multicast hold the modem at WIFI_PS_MIN_MODEM — wake every DTIM — for as
+ * long as they run. */
+static std::atomic<int> s_mcastRxHolds{0};
+
+static void netApplyPs() {
+  if (wifiState == ST_OFF) return;   /* doUp applies it on the next bring-up */
+  esp_wifi_set_ps(s_mcastRxHolds.load() > 0 ? WIFI_PS_MIN_MODEM : WIFI_PS_MAX_MODEM);
+}
+
+void netMulticastRxAcquire() {
+  s_mcastRxHolds.fetch_add(1);
+  netApplyPs();
+}
+
+void netMulticastRxRelease() {
+  /* Underflow guard: a stray release must not wedge the count below zero. */
+  if (s_mcastRxHolds.fetch_sub(1) <= 0) { s_mcastRxHolds.fetch_add(1); return; }
+  netApplyPs();
+}
+
 static void doUp(wifi_state_t newState) {
   /* Sync global so publishWifiStatus below sees the new state. The main loop
    * also assigns `wifiState = state` after we return, but subscribers to
    * wifi.{sta,ap}.up read the value published here. */
   wifiState = newState;
   s_linkUp = true;         /* set before fireEvent so late-replay is consistent */
-  esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+  netApplyPs();
   connectTimeMs = millis();
   trafficIn = trafficOut = 0;
   lastActivityMs = millis();
@@ -1950,6 +2020,12 @@ static void netTaskFn(void* arg) {
         info("idle, shutting down\n");
         doDown(state); wifiState = state; continue;
       }
+    }
+
+    /* A new IPv6 address reached VALID — publish it now, not on the 30s tick. */
+    if (connected && ip6Dirty) {
+      ip6Dirty = false;
+      publishWifiStatus();
     }
 
     /* Periodic status publishing (~30s) */
@@ -2559,6 +2635,10 @@ static void netCliCmd(const char* args) {
             cliPrintf("DNS:     %s, %s\n", dns1s, dns2s);
         else
             cliPrintf("DNS:     %s\n", dns1s);
+        char ip6[INET6_ADDRSTRLEN], ip6ll[INET6_ADDRSTRLEN];
+        staIp6Strings(ip6, sizeof(ip6), ip6ll, sizeof(ip6ll));
+        if (ip6[0])   cliPrintf("IPv6:    %s\n", ip6);
+        if (ip6ll[0]) cliPrintf("IPv6 LL: %s\n", ip6ll);
     }
     char inBuf[16], outBuf[16];
     fmtSize(trafficIn, inBuf, sizeof(inBuf));
