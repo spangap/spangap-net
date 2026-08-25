@@ -36,9 +36,12 @@ init.
 | `s.net.hostname` | (net's default) | Hostname / instance name; `<hostname>.local` is the advertised name. Owned by [net](net.md). |
 | `s.net.mdns.<name>` | — | One advertised `_<name>._tcp` service; value is a literal port or a config-key reference. |
 
-The built-in entries `s.net.mdns.http` (80) and `s.net.mdns.https` (443) are
-seeded by net's own defaults; the mDNS enable/port pane is generated from the
-straddle's declarative `settings:` block (no hand-written panel).
+There is nothing to configure but the master switch, which is a row at the foot
+of the WiFi pane: an advertised port is not a setting of its own, it is the port
+the service is already listening on. spangap-web seeds `http`/`https` as the
+key references `s.net.http_port` / `s.net.https_port`, resolved on every
+advertise, so what is announced is whatever the web server is configured for —
+80 and 443 unless somebody moved them.
 
 ## Read next
 

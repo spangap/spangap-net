@@ -52,7 +52,8 @@ settings:
       - { id: net, label: "WiFi & Network", short: "Network", order: 10 }
       - { id: wifi, label: "WiFi", short: "WiFi", order: 1 }
     rows:
-      - section: "WiFi Settings"
+      - title: "WiFi"
+      - heading: "Getting connected"
       - switch: { label: "Enable WiFi", key: "s.net.wifi.enable" }
       # Every row here is a string net.cpp publishes finished — the state and
       # the signal quality in words, the traffic pair as one line.
@@ -83,6 +84,7 @@ settings:
               when_key: wifi.sta.up
       - list:
           label: "Known networks"
+          caption: "Networks this device will try connecting to when it sees them. Drag them in the order you want in case multiple of these networks might be visible at the same time."
           key: s.net.wifi.nets
           id: id
           item: "{ssid}"
@@ -90,7 +92,7 @@ settings:
           # connected and which are merely in range is something only it knows.
           status: "wifi.netstat.{id}"
           empty: "No networks configured."
-          orderable: true
+          reorder: true
           cmd: wifi.net
           add:
             - label: "Add manually"
@@ -110,19 +112,19 @@ settings:
               do: { set: { key: "wifi.net.connect", value: "{id}" } }
           # The item's detail page. Opened by tapping the row, and it carries the
           # Connect and Delete buttons too, so the row itself is just the network.
-          # The SSID names the page rather than sitting on it: it is what the
-          # entry IS, and nothing here changes it. A field left out of `edit:`
-          # is not edited — net.cpp carries it forward on `.set` — so leaving it
-          # out is how a detail page says "not this".
+          # The SSID names the page rather than sitting on it — both surfaces
+          # head an editor with the `item:` template above, so there is no row
+          # for it here. A field left out of `edit:` is not edited — net.cpp
+          # carries it forward on `.set` — so leaving it out is how a detail
+          # page says "not this".
           edit:
-            - section: "{ssid}"
             - text:   { label: "Password", field: pass, secret: true }
-            - text: { label: "Fixed IP", field: ip, placeholder: "DHCP" }
-            - text: { label: "Netmask", field: mask, default: "255.255.255.0" }
+            - ipv4: { label: "IP", field: ip, placeholder: "DHCP" }
+            - ipv4: { label: "Netmask", field: mask, default: "255.255.255.0" }
               when_key: "{ip}"
-            - text: { label: "Gateway", field: gw }
+            - ipv4: { label: "Gateway", field: gw }
               when_key: "{ip}"
-            - text: { label: "DNS", field: dns }
+            - ipv4: { label: "DNS server", field: dns }
               when_key: "{ip}"
             # The hint is the MAC this device would actually use, which only the
             # firmware knows — hence the key rather than a literal.
@@ -135,36 +137,50 @@ settings:
             subtitle: "{detail}"
             found: "Found networks"
             refresh: { label: "Scan for networks", do: { set: { key: "wifi.scan", value: "1", edge: true } } }
-      - section: "Access Point"
-      - caption: "Becomes AP when no known networks found. 0 keeps it up until a known network appears; a number of seconds shuts it down after that much idle time."
-      - slider: { label: "Active for (s)", key: "s.net.wifi.ap.active_for", min: -1, max: 3600 }
-      - caption: "-1 disables the Access Point."
+      - heading: "Access point"
+      - switch: { label: "Enable fallback AP", key: "s.net.wifi.ap.enable", default: 1 }
+      - caption: "This device becomes a WiFi access point when no known networks are found."
+      # The timeout is a one-shot idle window per boot, so the interesting
+      # values are its neighbours rather than the whole range — hence the
+      # steppers, and a step that walks in five-minute rests.
+      - integer: { label: "Inactivity timeout", unit: "min", key: "s.net.wifi.ap.timeout",
+                   min: 0, max: 300, step: 5, buttons: true, default: 10 }
+        when_key: wifi.ap.enabled
+      - caption: "Setting this to 0 keeps the AP up until a known network appears, otherwise AP shuts down after this many minutes."
+        when_key: wifi.ap.enabled
       - text: { label: "SSID", key: "s.net.wifi.ap.ssid" }
         when_key: wifi.ap.enabled
       - text: { label: "Password", key: "s.net.wifi.ap.pass" }
         when_key: wifi.ap.enabled
-      - text: { label: "IP", key: "s.net.wifi.ap.ip" }
+      - ipv4: { label: "IP", key: "s.net.wifi.ap.ip" }
         when_key: wifi.ap.enabled
-      - text: { label: "Netmask", key: "s.net.wifi.ap.mask" }
+      - ipv4: { label: "Netmask", key: "s.net.wifi.ap.mask" }
         when_key: wifi.ap.enabled
       - value: { label: "AP address", key: "wifi.ap.ip", copyable: true }
         when_key: wifi.ap.up
+      # mDNS is how this device is found ON the local network, so it belongs at
+      # the foot of the WiFi pane rather than in a menu of its own.
+      - heading: "mDNS"
+      - caption: "This is the service that answers when anything on the local network is looking for <hostname>.local"
+      - switch: { label: "Enable mDNS", key: "s.net.mdns_enable", default: 1 }
+  # Reachability from OUTSIDE the local network. spangap-net owns the node and
+  # names it; the straddles that answer the question — upnp, duckdns, acme,
+  # wg — state the bare `id: reachable` and each contributes one heading group,
+  # ordered on their contributions rather than on init order.
   - at:
       - { id: net }
-      - { id: mdns, label: "mDNS", short: "mDNS" }
+      - { id: reachable, label: "Reachable from the internet", short: "Reachable", order: 2 }
+    order: 1
     rows:
-      - section: "mDNS"
-      - switch: { label: "Enable", key: "s.net.mdns_enable", default: 1 }
-      - text:   { label: "HTTP port", key: "s.net.mdns.http" }
-      - text:   { label: "HTTPS port", key: "s.net.mdns.https" }
+      - title: "Reachable from the internet"
   # System pane (top-level). Rows are defaultless: hostname/tz/server defaults
   # live in the s.net / s.ntp storageDefaultTree (net.cpp / ntp.cpp).
   - at:
       - { id: system }
     rows:
-      - section: "This System"
+      - section: "This system"
       - text: { label: "Hostname", key: "s.net.hostname" }
-      - section: "Time & Date"
+      - section: "Time & date"
       # The zone list is too long to be a static option list, so the picker is
       # the optionless `timezone:` field: each surface brings its own list
       # (the browser its Intl database, the LCD the firmware's built-in zone

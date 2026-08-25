@@ -109,7 +109,7 @@ its `net_port_msg_t`:
   `log`, `http`, `https`, `rtsp` all work this way.
 - **Registrant-owned** (`ownPort=1`): net binds `tcpPort` directly and never
   touches `s.net.*` — for a service whose port lives in its own config tree
-  (the TCP inbound server's port is `s.tcp.server_port`, not `s.net.*`).
+  (a TCP incoming port's number lives in its `s.tcp.servers` entry, not `s.net.*`).
   `tcpPort=0` means **close the socket**, so the registrant opens and closes its
   listener by re-registering as the service is enabled/disabled. `epOpenAll()`
   runs every poll, so a re-registration with a changed (or zeroed) `tcpPort`
@@ -136,10 +136,10 @@ joined clients) and switches to STA on a hit. `doUp()` sets `s_linkUp` before
 firing `NET_EV_UP` and `setUpstream()`; `doDown()` clears it before firing
 `NET_EV_DOWN` — late-replay consistency depends on that ordering.
 
-With `s.net.wifi.ap.active_for` > 0 the AP is a one-shot idle window: the
+With `s.net.wifi.ap.timeout` > 0 the AP is a one-shot idle window: the
 `ST_AP` loop tears the radio down (`doDown` → `ST_OFF`) once `lastActivityMs`
-is `active_for` seconds stale. `doUp()` stamps `lastActivityMs`, so an
-untouched AP lives exactly `active_for` seconds, and any TCP traffic (the
+is that many minutes stale. `doUp()` stamps `lastActivityMs`, so an
+untouched AP lives exactly the timeout, and any TCP traffic (the
 relay's `netActivity()`) restarts the timer — an active browser session keeps
 the AP alive for as long as it is used. The spent flag (`rtcApWindowUsed`)
 lives in RTC RAM: preserved across deep sleep (cron wakes don't re-arm the
@@ -148,8 +148,8 @@ set. `rtcWantUp` is deliberately left set, and `ST_OFF` with want-up + stored
 networks runs the radio-down rescan: every `ap.retry` seconds one pass of
 radio-up → `scanForKnown()` → connect on a hit / `radioOff()` on a miss, so
 walking back into range reconnects without a reboot — only the AP is spent.
-The same rescan covers `active_for = -1` (AP disabled) after a fruitless
-`ST_SCANNING` window. Writing `-1` while the AP is live (the settings toggle)
+The same rescan covers `s.net.wifi.ap.enable = 0` (AP disabled) after a fruitless
+`ST_SCANNING` window. Clearing it while the AP is live (the settings toggle)
 drops it on the next `ST_AP` iteration without spending the window —
 `rtcApWindowUsed` stays clear, so re-enabling later can start it again. `radioOff()` (stop + deinit + PM-lock release) is also
 what the `ST_SCANNING` → `ST_OFF` fallbacks use — they previously left the
@@ -276,8 +276,9 @@ That is what makes one description enough for both surfaces:
 `publishWifiStatus()` likewise publishes `wifi.sta.state_text`,
 `wifi.sta.signal` and `wifi.traffic` — the state, the signal quality and the
 byte counters as the sentences the rows show. `wifi.ap.enabled` is the plain
-truthy gate for the access-point rows, since `s.net.wifi.ap.active_for` is a
-value (-1 off, 0 until a known network, N idle seconds) and not a flag.
+truthy gate for the access-point rows — published rather than derived, like
+every other gate, so no settings surface reads a `s.` key to decide what to
+draw.
 
 The **timezone** is the one setting whose options are device data: the zone list
 is a file the browser refreshes from upstream, far too large for a descriptor, so

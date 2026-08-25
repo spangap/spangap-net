@@ -28,14 +28,14 @@ reference.
 ## Access-point lifetime
 
 When no known WiFi network is in range, the device brings up its own access
-point so it stays reachable. How long that AP lives is governed by
-`s.net.wifi.ap.active_for` (integer, default `300`):
+point so it stays reachable. Whether it comes up at all is
+`s.net.wifi.ap.enable` (default `1`); how long it then lives is
+`s.net.wifi.ap.timeout`, in **minutes** (default `10`):
 
-- **`-1`** — AP mode disabled; the AP never starts.
 - **`0`** — the AP stays up indefinitely, rescanning every
   `s.net.wifi.ap.retry` seconds and switching to STA the moment a known
   network appears.
-- **`N > 0`** — the AP shuts down after `N` seconds without link traffic,
+- **`N > 0`** — the AP shuts down after `N` minutes without link traffic,
   **once per boot**. Any TCP traffic (an open browser session) restarts the
   idle timer, so the AP lives exactly as long as someone is using it. The
   device then keeps rescanning for known networks every
@@ -46,8 +46,8 @@ point so it stays reachable. How long that AP lives is governed by
   for one more window. Deep-sleep wakes (cron) do not re-arm the spent
   window — only a real reset does.
 
-The browser WiFi panel exposes this as an *Enable AP* toggle (off writes
-`-1`) plus an *Active for* seconds field shown while enabled. See
+Both surfaces expose this as an *Enable fallback AP* toggle plus an
+*Inactivity timeout (min)* number shown while it is on. See
 [docs/net.md](docs/net.md) for the full key table and
 [docs/net-internals.md](docs/net-internals.md) for the state-machine detail.
 
@@ -70,8 +70,8 @@ full storage surface.
 A registrant can instead own its port itself (`ownPort` in `net_port_msg_t`):
 net binds the port it passes directly and never consults `s.net.*`, and a
 passed port of 0 closes the listener. This is for services whose port lives in
-their own config tree rather than net's — the TCP inbound server binds
-`s.tcp.server_port` and opens/closes as it's enabled/disabled. See
+their own config tree rather than net's — each TCP incoming port binds the
+port from its `s.tcp.servers` entry and opens/closes as it's enabled/disabled. See
 [docs/net-internals.md](docs/net-internals.md).
 
 ## What it does NOT own

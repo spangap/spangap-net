@@ -23,9 +23,10 @@ to make. On boot the task reads the master switch `s.net.wifi.enable`, then:
   configured), the device brings up its own access point so it is
   always reachable. From AP it keeps re-scanning every `s.net.wifi.ap.retry`
   seconds (non-disruptively, via APSTA) and switches to STA when a known network
-  appears. `s.net.wifi.ap.active_for` bounds this: `-1` never starts the AP,
-  `0` keeps it up until a known network appears, and `N>0` (default 300) shuts
-  the AP down after N seconds without link traffic, once per boot. Any TCP
+  appears. Two settings bound this. `s.net.wifi.ap.enable` at `0` never starts
+  the AP at all. `s.net.wifi.ap.timeout` is then how long it lives, in minutes:
+  `0` keeps it up until a known network appears, and `N>0` (default 10) shuts
+  the AP down after N minutes without link traffic, once per boot. Any TCP
   traffic restarts the idle timer, so an active browser session keeps the AP
   alive as long as it is used. After the window the device keeps rescanning
   for known networks every `s.net.wifi.ap.retry` seconds (radio off between
@@ -129,8 +130,7 @@ Defaults are seeded into `s.net.*` on first boot.
 | `s.net.log_port` | `0` | Plain-TCP log stream port; `0` = off. |
 | `s.net.cli_port` | `0` | Plain-TCP CLI port; `0` = off. |
 | `s.net.mdns_enable` | `1` | mDNS master switch (seeded from the `settings:` block). |
-| `s.net.mdns.http` | `80` | mDNS `_http._tcp` advertised port (literal or a config-key reference). |
-| `s.net.mdns.https` | `443` | mDNS `_https._tcp` advertised port. |
+| `s.net.mdns.<service>` | — | One advertised service per entry, seeded by whoever serves it, never by net. The value is a literal port or the name of the key holding the live one, resolved on every advertise — spangap-web seeds `http`/`https` as `s.net.http_port` / `s.net.https_port`, so the advertisement is whatever the web server is actually configured for. |
 | `s.net.dns.fqdn` | `""` | Public FQDN (set by [duckdns](../../duckdns) / [acme](../../acme); read by services that need the external name). |
 | `s.net.wifi.enable` | `1` | Master radio switch. Setting `0` brings WiFi down live and survives reboot. |
 | `s.net.wifi.ap.ssid` | `<hostname>_<MAC last 2 bytes>` | AP SSID — computed per-device on first boot so a fleet doesn't present identical APs (e.g. `reticulous_dcbc`). User-editable after. |
@@ -138,7 +138,8 @@ Defaults are seeded into `s.net.*` on first boot.
 | `s.net.wifi.ap.ip` | `192.168.1.1` | AP gateway IP. |
 | `s.net.wifi.ap.mask` | `255.255.255.0` | AP netmask. |
 | `s.net.wifi.ap.retry` | `300` | Seconds between background re-scans while in AP mode. |
-| `s.net.wifi.ap.active_for` | `300` | `-1`: never start the AP (setting it while the AP is live drops it immediately). `0`: AP stays up until a known network appears. `N>0`: AP shuts down after N seconds without link traffic (traffic restarts the timer), once per boot; known-network rescans continue every `ap.retry` seconds, only the AP is spent until reboot. (Replaced `ap.disable` in config v2.) |
+| `s.net.wifi.ap.enable` | `1` | `0`: never start the AP. Cleared while the AP is live (the settings toggle) it drops immediately; the window is not spent, so re-enabling can start it again. |
+| `s.net.wifi.ap.timeout` | `10` | Minutes of link idleness before the AP is spent. `0`: AP stays up until a known network appears. `N>0`: AP shuts down after N minutes without link traffic (traffic restarts the timer), once per boot; known-network rescans continue every `ap.retry` seconds, only the AP is spent until reboot. |
 | `s.net.wifi.nets` | `[]` | Array of known STA networks. |
 
 Each entry in `s.net.wifi.nets[i]` has: `ssid`, `pass`, and the optional
@@ -254,7 +255,7 @@ error removes the partial file.
 
 - **WiFi, mDNS and System** are all described by the `settings:` block in
   `straddle.yaml`, which the build lowers to the browser and to the display. The
-  same enable toggle, live status, known-network list (reorderable, with
+  same enable toggle, live status, known-network list (drag to reorder, with
   per-network DHCP/static-IP and custom-MAC editing), scan-and-adopt picker and
   access-point configuration appear on both — a browserless device can do
   everything a browser can.

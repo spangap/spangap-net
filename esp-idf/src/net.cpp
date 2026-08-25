@@ -1324,10 +1324,10 @@ static void publishWifiStatus() {
     storageSet("wifi.ap.netmask", "");
     storageSet("wifi.ap.up", 0);
   }
-  /* The access point's own switch is a value, not a flag: -1 is off, 0 is "up
-   * until a known network appears", N is "N idle seconds". A settings toggle
-   * needs a plain truthy gate for the rows that only matter while it is on. */
-  storageSet("wifi.ap.enabled", storageGetInt("s.net.wifi.ap.active_for", 300) >= 0 ? 1 : 0);
+  /* The plain truthy gate for the rows that only matter while the access point
+   * is on — published rather than left to a settings surface to derive, like
+   * every other gate here. */
+  storageSet("wifi.ap.enabled", storageGetInt("s.net.wifi.ap.enable", 1) ? 1 : 0);
   storageEnd();
   staNetPublishStatus();
 }
@@ -1457,24 +1457,34 @@ static bool connectSta(int idx) {
   return false;
 }
 
-/* s.net.wifi.ap.active_for policy:
- *   -1  AP mode disabled, never start it. Written while the AP is live
- *       (settings toggle), the ST_AP loop drops it immediately.
- *    0  AP stays up until a known network appears (the ap.retry rescan).
- *   N>0 (default 300) AP shuts down after N seconds without link traffic,
- *       once per boot. Any TCP traffic (a browser session) restarts the idle
- *       timer, so the AP lives exactly as long as someone is using it, and a
- *       pocketed device doesn't burn power beaconing. The device keeps
- *       rescanning for known networks every ap.retry seconds (radio off in
- *       between) — only the AP is spent; a reboot force-summons it. The
- *       spent window survives deep sleep (RTC RAM) so cron wakes don't
- *       re-arm it; any real reset reloads the RTC data segment and re-arms. */
+/* The access point's two settings:
+ *   s.net.wifi.ap.enable   0 never starts it. Written while the AP is live
+ *                          (the settings toggle), the ST_AP loop drops it
+ *                          immediately.
+ *   s.net.wifi.ap.timeout  minutes of idle before the AP is spent.
+ *                          0 keeps it up until a known network appears (the
+ *                          ap.retry rescan). N>0 (default 10) shuts it down
+ *                          after N minutes without link traffic, once per
+ *                          boot. Any TCP traffic (a browser session) restarts
+ *                          the idle timer, so the AP lives exactly as long as
+ *                          someone is using it, and a pocketed device doesn't
+ *                          burn power beaconing. The device keeps rescanning
+ *                          for known networks every ap.retry seconds (radio
+ *                          off in between) — only the AP is spent; a reboot
+ *                          force-summons it. The spent window survives deep
+ *                          sleep (RTC RAM) so cron wakes don't re-arm it; any
+ *                          real reset reloads the RTC data segment and
+ *                          re-arms. */
 RTC_DATA_ATTR static bool rtcApWindowUsed = false;
 
+/** The idle window in milliseconds; 0 means there isn't one. */
+static uint32_t apIdleMs() {
+  return (uint32_t)storageGetInt("s.net.wifi.ap.timeout", 10) * 60 * 1000;
+}
+
 static bool startAP() {
-  int activeFor = storageGetInt("s.net.wifi.ap.active_for", 300);
-  if (activeFor < 0) { dbg("AP disabled\n"); return false; }
-  if (activeFor > 0 && rtcApWindowUsed) {
+  if (!storageGetInt("s.net.wifi.ap.enable", 1)) { dbg("AP disabled\n"); return false; }
+  if (apIdleMs() > 0 && rtcApWindowUsed) {
     dbg("AP window already used this boot\n");
     return false;
   }
@@ -2104,23 +2114,23 @@ static void netTaskFn(void* arg) {
         break;
       case ST_AP:
         netPollOnce();
-        /* Timed AP window (active_for > 0): once the link has seen no traffic
-         * for active_for seconds, spend the window and drop the radio.
-         * doUp() stamps lastActivityMs, so an untouched AP lives exactly
-         * active_for seconds; any TCP traffic restarts the timer, so an
-         * in-progress browser session keeps it alive instead of being cut
-         * off mid-config. rtcWantUp stays set: the radio-down rescan above
-         * keeps looking for known networks — only the AP is spent until the
-         * next reboot. Note the up-time in the log: the last "mode: softAP"
-         * driver line may be the ap.retry APSTA scan flipping back, not the
-         * AP start, which makes the window look shorter than it was. */
-        { int activeFor = storageGetInt("s.net.wifi.ap.active_for", 300);
+        /* Timed AP window (ap.timeout > 0): once the link has seen no traffic
+         * for that many minutes, spend the window and drop the radio.
+         * doUp() stamps lastActivityMs, so an untouched AP lives exactly the
+         * timeout; any TCP traffic restarts the timer, so an in-progress
+         * browser session keeps it alive instead of being cut off mid-config.
+         * rtcWantUp stays set: the radio-down rescan above keeps looking for
+         * known networks — only the AP is spent until the next reboot. Note
+         * the up-time in the log: the last "mode: softAP" driver line may be
+         * the ap.retry APSTA scan flipping back, not the AP start, which makes
+         * the window look shorter than it was. */
+        { uint32_t idleMs = apIdleMs();
           /* Disabled while live (settings toggle): drop the AP on the spot.
            * The window isn't "spent" — rtcApWindowUsed stays clear, so
            * re-enabling later can start it again. The OFF-state rescan keeps
-           * looking for known networks; startAP() itself refuses while
-           * active_for < 0, so the AP won't come back until re-enabled. */
-          if (activeFor < 0) {
+           * looking for known networks; startAP() itself refuses while the
+           * switch is off, so the AP won't come back until re-enabled. */
+          if (!storageGetInt("s.net.wifi.ap.enable", 1)) {
             info("AP disabled, dropping (up %u s)\n",
                  (unsigned)((millis() - connectTimeMs) / 1000));
             lastOffScanMs = millis();
@@ -2128,10 +2138,10 @@ static void netTaskFn(void* arg) {
             wifiState = state;
             continue;
           }
-          if (activeFor > 0 &&
-              millis() - lastActivityMs >= (uint32_t)activeFor * 1000) {
-            info("AP idle for %d s (up %u s), AP off until reboot\n",
-                 activeFor, (unsigned)((millis() - connectTimeMs) / 1000));
+          if (idleMs > 0 && millis() - lastActivityMs >= idleMs) {
+            info("AP idle for %u min (up %u s), AP off until reboot\n",
+                 (unsigned)(idleMs / 60000),
+                 (unsigned)((millis() - connectTimeMs) / 1000));
             rtcApWindowUsed = true;
             lastOffScanMs = millis();
             doDown(state);
@@ -2647,8 +2657,7 @@ static void netCliCmd(const char* args) {
 }
 
 /* Module config version. Bump when adding/changing defaults. See duckdns.cpp.
- * net owns its sub-domains: s.net.{hostname,*_port,mdns,wifi.*,dns.*}.
- * v2: ap.disable folded into ap.active_for (-1 = disabled). */
+ * net owns its sub-domains: s.net.{hostname,*_port,mdns,wifi.*,dns.*}. */
 #define NET_VERSION 2
 
 /* ================= Wi-Fi traffic ring (activity monitor) ================= */
@@ -2842,7 +2851,6 @@ void netInit() {
       "log_port":    0,
       "cli_port":    0,
       "webrtc_port": 4433,
-      "mdns": { "http": 80, "https": 443 },
       "dns":  { "fqdn": "" },
       "wifi": {
         "enable": 1,
@@ -2851,8 +2859,7 @@ void netInit() {
           "pass": "",
           "ip":   "192.168.1.1",
           "mask": "255.255.255.0",
-          "retry": 300,
-          "active_for": 300
+          "retry": 300
         },
         "nets": []
       }
@@ -2871,13 +2878,7 @@ void netInit() {
       snprintf(apssid, sizeof(apssid), "%s_%02x%02x", host, mac[4], mac[5]);
       storageDefault("s.net.wifi.ap.ssid", apssid);
     }
-    /* v1 -> v2: the old boolean ap.disable becomes ap.active_for = -1. */
-    storageBegin();
-    if (storageGetInt("s.net.wifi.ap.disable"))
-      storageSet("s.net.wifi.ap.active_for", -1);
-    storageUnset("s.net.wifi.ap.disable");
     storageSet("s.net.version", NET_VERSION);
-    storageEnd();
   }
 
   /* Suppress noisy WiFi driver block-ack renegotiation logs */
