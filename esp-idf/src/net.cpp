@@ -161,7 +161,8 @@ static void fireEvent(int event, const char* arg = nullptr) {
 
 /* ---- TCP call center: endpoint table + client proxy ---- */
 
-#define NET_MAX_ENDPOINTS 8
+/* NET_MAX_ENDPOINTS is net.h's — a caller of netPublicPorts() sizes its array
+ * from it. */
 #define NET_MAX_CLIENTS   8
 
 struct net_endpoint_t {
@@ -174,6 +175,7 @@ struct net_endpoint_t {
     bool ownPort;     /* registrant manages the port: bind `port` directly (0 = closed),
                        * never consult s.net.<nvsKey>. See net_port_msg_t.ownPort. */
     int fixedPort;    /* desired port when ownPort — re-registration updates it */
+    bool publicFacing; /* registrant wants this port reachable from the internet */
     bool tls;
     bool tcpNoDelay;
     bool keepAlive;
@@ -199,6 +201,10 @@ struct net_client_t {
 
 static net_endpoint_t netEps[NET_MAX_ENDPOINTS];
 static int netEpCount = 0;
+/* Set wherever the public-facing set moves — a socket opening or closing, a
+ * registrant flipping its flag — and drained in epOpenAll, so the event fires
+ * once per poll pass and never from inside the walk over netEps. */
+static bool netPortsDirty = false;
 static net_client_t netClients[NET_MAX_CLIENTS];
 static uint8_t* netProxyBuf;  /* 4096 bytes, PSRAM */
 
@@ -216,7 +222,7 @@ static net_endpoint_t* epFindByKey(const char* nvsKey) {
  * net → core, never the reverse. */
 static void epRegister(TaskHandle_t task, uint16_t itsPort, const char* nvsKey,
                        int defaultPort, bool ownPort, int fixedPort,
-                       bool tls, bool keepAlive, int backlog) {
+                       bool publicFacing, bool tls, bool keepAlive, int backlog) {
     if (!task) return;
     net_endpoint_t* ep = epFindByKey(nvsKey);
     if (!ep) {
@@ -235,6 +241,12 @@ static void epRegister(TaskHandle_t task, uint16_t itsPort, const char* nvsKey,
      * epOpenAll) sees the resolved port move and rebinds/closes. */
     ep->ownPort = ownPort;
     ep->fixedPort = fixedPort;
+    /* Re-registration is also how the flag moves — a listener the operator has
+     * just published to the internet, or withdrawn from it. */
+    if (ep->publicFacing != publicFacing) {
+        ep->publicFacing = publicFacing;
+        netPortsDirty = true;
+    }
     ep->tls = tls;
     ep->tcpNoDelay = true;
     ep->keepAlive = keepAlive;
@@ -246,7 +258,7 @@ static void netOnAux(TaskHandle_t sender, const void* data, size_t len) {
     if (len < sizeof(net_port_msg_t)) return;
     auto* msg = (const net_port_msg_t*)data;
     epRegister(sender, msg->itsPort, msg->nvsKey, msg->defaultPort,
-               msg->ownPort != 0, msg->tcpPort,
+               msg->ownPort != 0, msg->tcpPort, msg->publicFacing != 0,
                msg->tls, msg->keepAlive, msg->backlog);
 }
 
@@ -257,10 +269,10 @@ static void netOnAux(TaskHandle_t sender, const void* data, size_t len) {
  * s.net.cli_port / s.net.log_port. */
 static void netRegisterCorePorts() {
     epRegister(xTaskGetHandle("cli"), CLI_PORT_TCP, "cli_port", 0,
-               /*ownPort=*/false, /*fixedPort=*/0,
+               /*ownPort=*/false, /*fixedPort=*/0, /*publicFacing=*/false,
                /*tls=*/false, /*keepAlive=*/false, /*backlog=*/0);
     epRegister(xTaskGetHandle("log"), LOG_PORT_TCP, "log_port", 0,
-               /*ownPort=*/false, /*fixedPort=*/0,
+               /*ownPort=*/false, /*fixedPort=*/0, /*publicFacing=*/false,
                /*tls=*/false, /*keepAlive=*/false, /*backlog=*/0);
 }
 
@@ -291,6 +303,7 @@ static void epOpenPort(net_endpoint_t& ep) {
         info("closing port %d (%s)\n", ep.port, ep.nvsKey);
         close(ep.serverFd);
         ep.serverFd = -1;
+        if (ep.publicFacing) netPortsDirty = true;
     }
     ep.port = newPort;
     if (newPort <= 0) return;
@@ -308,11 +321,30 @@ static void epOpenPort(net_endpoint_t& ep) {
     }
     fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK);
     ep.serverFd = s;
+    if (ep.publicFacing) netPortsDirty = true;
     info("opening port %d (%s)\n", newPort, ep.nvsKey);
 }
 
 static void epOpenAll() {
     for (int i = 0; i < netEpCount; i++) epOpenPort(netEps[i]);
+    /* Fired after the walk, not inside it: a handler is free to register an
+     * endpoint of its own, and that would move netEps under the loop. */
+    if (netPortsDirty) {
+        netPortsDirty = false;
+        fireEvent(NET_EV_PORTS_CHANGED);
+    }
+}
+
+int netPublicPorts(net_public_port_t* out, int max) {
+    int n = 0;
+    for (int i = 0; i < netEpCount && n < max; i++) {
+        const net_endpoint_t& ep = netEps[i];
+        if (!ep.publicFacing || ep.serverFd < 0 || ep.port <= 0) continue;
+        out[n].port = (uint16_t)ep.port;
+        safeStrncpy(out[n].nvsKey, ep.nvsKey, sizeof(out[n].nvsKey));
+        n++;
+    }
+    return n;
 }
 
 static void netClientClose(net_client_t& c) {

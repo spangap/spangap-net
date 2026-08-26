@@ -115,6 +115,18 @@ its `net_port_msg_t`:
   runs every poll, so a re-registration with a changed (or zeroed) `tcpPort`
   rebinds or closes on the next pass — no reboot, no config key.
 
+Either kind may carry `publicFacing`, the registrant's statement that this
+listener belongs on the internet. Net stores it on the endpoint and does nothing
+else with it: `netPublicPorts()` reports the flagged endpoints that currently
+have a socket open, and that is the whole surface a port mapper reads. The set
+moves in three places — a socket opening, a socket closing, and a re-registration
+that flips the flag — and each sets `netPortsDirty` rather than firing there and
+then. `epOpenAll()` drains it into one `NET_EV_PORTS_CHANGED` **after** its walk
+over `netEps`, because a handler is free to register an endpoint of its own and
+that would move the table under the loop. `epCloseAll()` (link down) deliberately
+does not fire: the set is unreadable and unusable while the link is gone, and
+every listener is reopened — re-marking the flag — on the way back up.
+
 **Outbound dial** (`netOnDialConnect`) runs `netDialSync` on the net task:
 `getaddrinfo` with `AF_UNSPEC`, then a bounded non-blocking connect over each
 candidate (8 s) — a slow DNS lookup briefly stalls the select loop, acceptable

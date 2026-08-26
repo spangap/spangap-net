@@ -75,6 +75,17 @@ service ships its port as a config key under `s.net.*` and net re-opens the
 socket when that key changes. Set `tls = 1` and net does TLS termination on the
 port (see [tls.md](tls.md)); the registering task always receives plain bytes.
 
+**Publish a port to the internet.** `publicFacing = 1` in the same message says
+this listener is meant to be reachable from outside the LAN — a flag, not a port
+number. Net keeps the flag with the endpoint and reports every *open*
+public-facing port through `netPublicPorts()`; the [upnp](../../upnp) straddle
+reads that list and asks the router to forward each one in at the same external
+port, and `NET_EV_PORTS_CHANGED` tells it when the list has moved. Net itself
+opens no holes and needs no port mapper to be in the build — the flag is a
+statement of intent that a mapper may or may not be there to act on. Re-send the
+registration to change it: net keys endpoints by `nvsKey`, so a re-send updates
+the one already there rather than adding another.
+
 **Dial outbound.** Connect to net on `NET_PORT_TCP_DIAL` with an ASCII
 `"host:port"` payload (≤95 bytes). Net does the DNS lookup and connect on its own
 task, and the accepted ITS handle *is* the TCP byte stream from byte zero, with
@@ -97,6 +108,7 @@ Declared in [include/net.h](../esp-idf/include/net.h):
 | `netMulticastRxAcquire()` / `netMulticastRxRelease()` | Refcounted hold: while held, WiFi modem power-save stays at `WIFI_PS_MIN_MODEM` (wake for every DTIM beacon — when the AP transmits buffered multicast) instead of the default `WIFI_PS_MAX_MODEM`, which sleeps through most multicast. Hold while a service depends on receiving multicast; safe from any task, applied immediately and on every later bring-up. |
 | `netTrafficIn/Out(bytes)` | Add to the traffic counters (for tasks with their own sockets, e.g. WebRTC UDP; net's own relayed TCP is counted automatically). |
 | `netForceClose(itsHandle)` | RST a relayed TCP connection. |
+| `netPublicPorts(out, max)` | Fill `out[]` with the open listen ports whose registrant set `publicFacing`, and return how many. What a port mapper forwards; safe from any task. |
 
 `NET_EV_*` values, `net_port_msg_t`, and the `net_connect_t` connect payload
 (`ws` / `tls` / `clientAddr`, sent on every inbound connection) are in the
@@ -112,6 +124,7 @@ header.
 | `NET_EV_UPSTREAM_DOWN` | STA leaving connected (disconnect / reconnect loop / drop to AP-only). | Edge-only. |
 | `NET_EV_CFG_CHANGED` | A watched config key changed; `arg` is the key name. | Edge-only. |
 | `NET_EV_POLL` | Periodic, ~10 ms while connected. | Edge-only. |
+| `NET_EV_PORTS_CHANGED` | A public-facing listen socket opened or closed, or a registrant flipped `publicFacing`. Fires from the endpoint-open pass — the net task, or whoever wrote an `s.net.*` key — so a handler defers its work instead of doing it inline. | Edge-only. |
 
 ## Storage variables
 

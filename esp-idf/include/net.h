@@ -42,6 +42,12 @@ enum {
                              disconnect, reconnect-loop, or transition to AP-only. */
     NET_EV_CFG_CHANGED,   /* config key changed. arg = key name */
     NET_EV_POLL,          /* periodic (~10ms when connected). arg = NULL */
+    NET_EV_PORTS_CHANGED, /* a public-facing listen socket opened or closed, or a
+                             registrant changed its publicFacing flag. arg = NULL.
+                             Fired from the endpoint-open pass, which runs on the
+                             net task and on whoever writes an s.net.* key, so a
+                             handler defers its work rather than doing it inline.
+                             Read the new set with netPublicPorts(). */
     NET_EV_COUNT
 };
 
@@ -142,9 +148,31 @@ typedef struct {
                            *     never consults s.net.<nvsKey>. Re-send to change
                            *     it — net rebinds/closes on its next poll.
                            * 0 = config-driven: port is s.net.<nvsKey> or defaultPort. */
+    uint8_t publicFacing; /* 1 = this listener is meant to be reachable from the
+                           *     internet, so a port-mapper (upnp) forwards it in
+                           *     from the WAN at the same external port. A flag,
+                           *     not a port number. Re-send to change it. */
     char nvsKey[16];      /* local name; net looks up "s.net.<nvsKey>" (e.g. "rtsp_port") */
     int  defaultPort;     /* default if config key missing (config-driven only) */
 } net_port_msg_t;
+
+/** How many TCP endpoints net holds at once — and so the most ports
+ *  netPublicPorts() can ever return. */
+#define NET_MAX_ENDPOINTS 8
+
+/** One open listen port whose registrant asked to be reachable from the
+ *  internet — what a port-mapper forwards. */
+typedef struct {
+    uint16_t port;        /* the port net currently has open */
+    char     nvsKey[16];  /* the registrant's name for it */
+} net_public_port_t;
+
+/** Copy the currently-open public-facing listen ports into out[] (at most
+ *  `max`); returns how many were written. Safe to call from any task: the
+ *  endpoint table is only ever appended to and written by the net task, so a
+ *  concurrent read can see a stale port but never a torn table.
+ *  NET_EV_PORTS_CHANGED says when to read it again. */
+int netPublicPorts(net_public_port_t* out, int max);
 
 /* ---- ITS connect payload: net/web → task ---- */
 

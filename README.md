@@ -67,6 +67,14 @@ straddles read them and register listeners, but the keys live here: `http_port`
 off-by-default `log_port` / `cli_port`. See [docs/net.md](docs/net.md) for the
 full storage surface.
 
+A registration also says whether its port belongs on the internet
+(`publicFacing` in `net_port_msg_t` — a flag, not a port number). Net opens no
+holes itself: it reports the flagged ports that are actually open through
+`netPublicPorts()`, and [upnp](../upnp) forwards each one in from the router at
+the same external port. That is how an RNS TCP incoming port or the RNode TCP
+door gets its "Accessible from internet" switch without either straddle knowing
+what a port mapper is.
+
 A registrant can instead own its port itself (`ownPort` in `net_port_msg_t`):
 net binds the port it passes directly and never consults `s.net.*`, and a
 passed port of 0 closes the listener. This is for services whose port lives in
