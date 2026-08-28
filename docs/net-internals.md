@@ -140,7 +140,7 @@ at the RNS-reconnect cadence. The dial fd reuses a `netClients` slot with
 warning: a WPA2-length passphrase raising the authmode threshold off OPEN is what
 having a passphrase means. The line is kept, at the level it is worth.
 
-`ST_SCANNING` calls `scanForKnown()` (active scan, match against
+`ST_SCANNING` calls `wifiScanRun(true)` (active scan, match against
 `s.net.wifi.nets[]`); a match gets `WIFI_CONNECT_RETRIES` (3) attempts before AP
 fallback, so one slow DHCP doesn't bump the user off their network. `ST_AP`
 re-scans every `s.net.wifi.ap.retry` seconds via APSTA (keeping the AP up for
@@ -158,7 +158,7 @@ lives in RTC RAM: preserved across deep sleep (cron wakes don't re-arm the
 AP), reloaded to false by any real reset, and `startAP()` refuses while it is
 set. `rtcWantUp` is deliberately left set, and `ST_OFF` with want-up + stored
 networks runs the radio-down rescan: every `ap.retry` seconds one pass of
-radio-up → `scanForKnown()` → connect on a hit / `radioOff()` on a miss, so
+radio-up → `wifiScanRun(true)` → connect on a hit / `radioOff()` on a miss, so
 walking back into range reconnects without a reboot — only the AP is spent.
 The same rescan covers `s.net.wifi.ap.enable = 0` (AP disabled) after a fruitless
 `ST_SCANNING` window. Clearing it while the AP is live (the settings toggle)
@@ -279,11 +279,12 @@ That is what makes one description enough for both surfaces:
   network under `wifi.netstat.<id>`. Which network is connected and which are
   merely in range is something only this task knows, so it says so in finished
   words instead of leaving each surface to cross-reference the scan cache.
-- **Candidates** are `wifi.scanned`, which `publishScanResults()` now writes with
-  a `name` and a `detail` line (bars, dBm, lock marker) already rendered — so no
-  surface has to know that an empty SSID means hidden or which dBm deserves which
-  bars. Leaving the pane clears `wifi.scan`, which is the whole "stop scanning on
-  leave" contract.
+- **Candidates** are `wifi.scanned`, which `wifiScanRun()` writes with a `name`
+  and a `detail` line (bars, dBm, lock marker) already rendered — so no surface
+  has to know that an empty SSID means hidden or which dBm deserves which bars.
+  Every scan writes it, whatever asked for one, so it is always the radio's most
+  recent look around. Leaving the pane clears `wifi.scan`, which is the whole
+  "stop scanning on leave" contract.
 
 `publishWifiStatus()` likewise publishes `wifi.sta.state_text`,
 `wifi.sta.signal` and `wifi.traffic` — the state, the signal quality and the

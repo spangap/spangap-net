@@ -172,13 +172,13 @@ default MAC).
 | `wifi.sta.ip6` / `wifi.sta.ip6_ll` | Best non-link-local IPv6 address (global scope preferred over unique-local) and the link-local, RFC 5952 text. Empty until SLAAC / duplicate-address detection delivers one; the settings rows hide on empty. IPv6 has no settings: the addresses are always automatic (link-local + SLAAC), so unlike v4 there is no static configuration to offer. |
 | `wifi.ap.state` | `off` / `active`. |
 | `wifi.ap.{ssid,ip,netmask,up}` | AP detail when active. |
-| `wifi.scanned` | JSON array of nearby networks (`{ssid,bssid,rssi,locked}`, strongest first), published while a scan is requested. One row per SSID — when several APs serve the same network only the loudest is listed; hidden (empty-SSID) APs are kept individually. |
+| `wifi.scanned` | JSON array of nearby networks (`{ssid,bssid,rssi,locked}`, strongest first), rewritten by **every** scan whatever asked for it — the connect search, the browser beat, `net scan` — so it is always the radio's most recent look around. One row per SSID — when several APs serve the same network only the loudest is listed; hidden (empty-SSID) APs are kept individually. |
 
 ### Command sentinels (write to trigger; net clears them)
 
 | Key | Action |
 |---|---|
-| `wifi.scan` | `1` starts publishing `wifi.scanned` (re-scans every 20 s while set). **The re-scan runs while associated too**, and a scan takes the one radio off its channel — so a UI that arms this key owns clearing it, and one left set is a join/rejoin cycle for as long as it stands. |
+| `wifi.scan` | `1` re-scans every 20 s while set, keeping `wifi.scanned` fresh. **The re-scan runs while associated too**, and a scan takes the one radio off its channel — so a UI that arms this key owns clearing it, and one left set is a join/rejoin cycle for as long as it stands. `wifi.scanned` is published by every scan regardless of this key; what the key buys is a scan on a beat rather than only when something else needed one. |
 | `wifi.connect` | `<idx>` joins the known network at that array index. Like every sentinel here it is **cleared by net as it takes the command**, and a clear arrives at subscribers as an empty value — so a reader of this key must ignore an empty one rather than let `atoi` turn it into index 0. |
 | `wifi.disconnect` | `1` drops the current STA and returns to AP. |
 | `wifi.cmd.add` | `"<ssid>\t<pass>"` adds (or updates) a known network and joins it. |
@@ -202,7 +202,7 @@ See [safe-mode.md](../../spangap-core/docs/safe-mode.md).
 net                       WiFi status (state, SSID/IP/DNS, AP detail, traffic)
 net up | down | down!     bring WiFi up / down (graceful) / down immediately
 net list                  list stored networks (* marks the connected one)
-net scan                  access points seen this boot, loudest first
+net scan                  scan now, then list every AP seen this boot
 net add <ssid> [pass]     save a network (quote spaces) and join if not on STA
 net join <ssid>           force-join a known network
 net delete <ssid>         remove a network (and disconnect if it was current)
@@ -218,17 +218,45 @@ wget -O <file> <url>      download to a specific file
 
 Run any of these on-device through `spangap cli "<command>"`.
 
-### `net scan`
+### One scan, one record of it
 
-Prints the access-point cache the ordinary scan cycle has already built. It does
-**not** start a scan: the connect path scans anyway, so the list is there as soon
-as that has run once.
+Every scan the radio runs goes through `wifiScanRun()` — the connect search, the
+browser's 20-second beat, `net scan` — because a scan is one look at the
+neighbourhood and there is only ever one of those. It feeds the cache, publishes
+`wifi.scanned` and answers the connect search's question, in that order, so no
+two views of what the radio just heard can disagree.
 
 The cache holds one record per SSID and accumulates across every scan this boot,
 keeping the loudest RSSI a network has ever shown — so the picture fills in over
 time rather than being whatever the most recent single scan happened to hear.
 Hidden SSIDs are skipped, and it is reset only by a reboot. The same cache is
 what limits `scan found …` to one log line per network per boot.
+
+### `net scan`
+
+Scans now, then prints the cache. The scan runs on the net task — the radio is
+its, and two tasks must not both be driving a scan — so the CLI sends the
+request and waits for the generation counter to move, printing a dot a second.
+Wherever the radio is when the request lands: down brings it up for the scan and
+puts it straight back; on this node's own AP it goes APSTA so clients keep their
+connection. A known network turning up in the results is *not* acted on — asking
+what is in earshot is not asking to be moved onto it.
+
+**Ctrl-C abandons the wait, not the scan.** The scan is the net task's and
+finishes either way, so its results are in the cache a moment later regardless.
+
+`net scan -O` does not scan. It is the onboarding contract, read over the framed
+channel by a caller holding a two-second timeout that a full sweep of the band
+does not fit inside, and it answers from the cache — free, instant, and as
+current as the last scan by anyone.
+
+### Waiting for a connect
+
+`net add` (when it joins) and `net join` print `connecting` with a dot a second
+until the attempt reaches a conclusion — associated, fallen back to this node's
+own AP, or radio off — and then print exactly what `net` prints. Ctrl-C stops the
+waiting; the connect attempt is the net task's and runs to its own end either
+way, which is what makes the abort free to take.
 
 ### `-O`, onboarding output
 

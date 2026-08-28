@@ -98,7 +98,7 @@ static uint32_t trafficOut = 0;
 
 /* ITS aux command interface */
 enum { NET_CMD_UP = 1, NET_CMD_DOWN, NET_CMD_FORCE_DOWN, NET_CMD_CONNECT, NET_CMD_DISCONNECT,
-       NET_CMD_WIFI_ADD, NET_CMD_WIFI_DEL };
+       NET_CMD_WIFI_ADD, NET_CMD_WIFI_DEL, NET_CMD_SCAN };
 static volatile int cmdConnectIdx = -1;  /* target network index for NET_CMD_CONNECT */
 /* On-device WiFi add/delete sentinels (LCD WiFi pane). Captured once by the
  * wifi.cmd.* subscribers, applied in the net task loop (see netTaskFn). */
@@ -1054,7 +1054,24 @@ static scan_seen_t* scanSeenNote(const char* ssid, int8_t rssi, bool open) {
   return s;
 }
 
-static int scanForKnown() {
+/* THE scan. Every scan this device runs comes through here — the connect
+ * search, the browser's refresh beat, `net scan` — because a scan is one
+ * sighting of the neighbourhood and there is only ever one of those. It feeds
+ * the boot cache, publishes `wifi.scanned`, and answers the connect search's
+ * question, so no two views of the radio's last look around can disagree.
+ *
+ * `wifi.scanned` is a JSON array, one element per network: {ssid, bssid, rssi,
+ * locked} plus `name` and `detail` — the two lines a settings row shows,
+ * rendered here. A settings surface should be able to list what the radio can
+ * see without knowing that an empty SSID means a hidden network or which dBm
+ * figures deserve which bars.
+ *
+ * `searching` says the scan belongs to a connect attempt, and governs LOGGING
+ * only: the summary line explains a state transition there, and is noise on a
+ * 20-second refresh beat. Returns the index of the first CONFIGURED network
+ * present — configured order, not signal order: the stored list is a
+ * preference, so the first one in range wins however loud the others are. */
+static int wifiScanRun(bool searching) {
   esp_wifi_scan_stop();   /* drop any wedged/in-flight scan left by a prior attempt */
   wifi_scan_config_t scan_config = {};
   esp_err_t e = esp_wifi_scan_start(&scan_config, true);
@@ -1063,60 +1080,90 @@ static int scanForKnown() {
   esp_wifi_scan_get_ap_num(&ap_count);
   int nNets = staNetCount();
   if (ap_count == 0) {
-    if (nNets) info("0 Access Points found, none of our %d known networks in range\n", nNets);
-    else       info("0 Access Points found\n");
+    storageSetTree("wifi.scanned", cJSON_CreateArray());
+    if (!searching)  dbg("0 Access Points found\n");
+    else if (nNets)  info("0 Access Points found, none of our %d known networks in range\n", nNets);
+    else             info("0 Access Points found\n");
     return -1;
   }
   wifi_ap_record_t* ap_list = (wifi_ap_record_t*)gp_alloc(ap_count * sizeof(wifi_ap_record_t));
   if (!ap_list) return -1;
   esp_wifi_scan_get_ap_records(&ap_count, ap_list);
-  /* Hidden networks (empty SSID) collapse into one "unique SSID" — good
-   * enough for a summary count. */
+
+  /* Loudest first, in place: the cache, the published list and the duplicate
+   * collapse below all want the strongest AP of a network to be the one they
+   * meet first — which is also what makes noting only the first sighting of an
+   * SSID equivalent to noting them all and keeping the best. */
+  for (int i = 0; i < ap_count - 1; i++)
+    for (int j = i + 1; j < ap_count; j++)
+      if (ap_list[j].rssi > ap_list[i].rssi) {
+        wifi_ap_record_t tmp = ap_list[i]; ap_list[i] = ap_list[j]; ap_list[j] = tmp;
+      }
+
+  /* Hidden networks (empty SSID) collapse into one "unique SSID" for the
+   * summary count — good enough for a count — but each keeps its own published
+   * row, because they are distinct APs and nothing else tells them apart. */
+  cJSON* arr = cJSON_CreateArray();
   int uniq = 0;
   for (int i = 0; i < ap_count; i++) {
-    dbg("  '%s' ch%d %ddBm\n", (const char*)ap_list[i].ssid, ap_list[i].primary, ap_list[i].rssi);
+    const wifi_ap_record_t& ap = ap_list[i];
+    dbg("  '%s' ch%d %ddBm\n", (const char*)ap.ssid, ap.primary, ap.rssi);
     bool dup = false;
     for (int j = 0; j < i && !dup; j++)
-      dup = strcmp((const char*)ap_list[j].ssid, (const char*)ap_list[i].ssid) == 0;
+      dup = strcmp((const char*)ap_list[j].ssid, (const char*)ap.ssid) == 0;
     if (!dup) uniq++;
-  }
-  /* Announce each SSID we haven't named yet this boot, strongest first, at info
-   * so the environment is visible without debug logging and every scan can add
-   * networks that only just came into range. */
-  int* order = (int*)gp_alloc(ap_count * sizeof(int));
-  if (order) {
-    for (int i = 0; i < ap_count; i++) order[i] = i;
-    for (int i = 0; i < ap_count - 1; i++)
-      for (int j = i + 1; j < ap_count; j++)
-        if (ap_list[order[j]].rssi > ap_list[order[i]].rssi) {
-          int t = order[i]; order[i] = order[j]; order[j] = t;
-        }
-    for (int i = 0; i < ap_count; i++) {
-      const wifi_ap_record_t& ap = ap_list[order[i]];
-      if (!ap.ssid[0]) continue;  /* hidden network — nothing to name */
+
+    /* Announce each SSID not named yet this boot, at info so the environment
+     * is visible without debug logging and every scan can add networks that
+     * only just came into range. */
+    if (ap.ssid[0] && !dup) {
       scan_seen_t* s = scanSeenNote((const char*)ap.ssid, ap.rssi,
                                     ap.authmode == WIFI_AUTH_OPEN);
-      if (!s || s->named) continue;  /* cache full, or dups + prior scans */
-      s->named = true;
-      info("scan found \"%s\" %ddBm%s\n", s->ssid, s->rssi, s->open ? " open" : "");
+      if (s && !s->named) {
+        s->named = true;
+        info("scan found \"%s\" %ddBm%s\n", s->ssid, s->rssi, s->open ? " open" : "");
+      }
     }
-    free(order);
+    if (dup && ap.ssid[0]) continue;   /* published list: one row per named network */
+
+    cJSON* obj = cJSON_CreateObject();
+    cJSON_AddStringToObject(obj, "ssid", (const char*)ap.ssid);
+    char bssid[18];
+    snprintf(bssid, sizeof(bssid), "%02x:%02x:%02x:%02x:%02x:%02x",
+             ap.bssid[0], ap.bssid[1], ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5]);
+    cJSON_AddStringToObject(obj, "bssid", bssid);
+    cJSON_AddNumberToObject(obj, "rssi", ap.rssi);
+    bool locked = ap.authmode != WIFI_AUTH_OPEN;
+    cJSON_AddNumberToObject(obj, "locked", locked ? 1 : 0);
+    cJSON_AddStringToObject(obj, "name", ap.ssid[0] ? (const char*)ap.ssid : "(hidden)");
+    int r = ap.rssi;
+    const char* bars = r >= -55 ? "\xE2\x96\x82\xE2\x96\x84\xE2\x96\x86\xE2\x96\x88"
+                     : r >= -65 ? "\xE2\x96\x82\xE2\x96\x84\xE2\x96\x86"
+                     : r >= -75 ? "\xE2\x96\x82\xE2\x96\x84"
+                                : "\xE2\x96\x82";
+    char detail[48];
+    snprintf(detail, sizeof(detail), "%s  %d dBm%s", bars, r, locked ? "  \xF0\x9F\x94\x92" : "");
+    cJSON_AddStringToObject(obj, "detail", detail);
+    cJSON_AddItemToArray(arr, obj);
   }
+  storageSetTree("wifi.scanned", arr);
+
   int bestIdx = -1;
   char matched[33] = "";
-  for (int s = 0; s < nNets; s++) {
+  for (int s = 0; s < nNets && bestIdx < 0; s++) {
     char ssid[33];
     staNetGet(s, "ssid", ssid, sizeof(ssid));
     for (int i = 0; i < ap_count; i++)
       if (strcmp((const char*)ap_list[i].ssid, ssid) == 0) {
         bestIdx = s;
-        memcpy(matched, ssid, sizeof(matched));
-        goto found;
+        safeStrncpy(matched, ssid, sizeof(matched));
+        break;
       }
   }
-found:
   free(ap_list);
-  if (bestIdx >= 0)
+  if (!searching)
+    dbg("%d different Access Points, %d unique SSIDs\n", ap_count, uniq);
+  else if (bestIdx >= 0)
     info("%d different Access Points, %d unique SSIDs, found our known network '%s'\n",
          ap_count, uniq, matched);
   else if (nNets)
@@ -1145,71 +1192,6 @@ static void setUpstream(bool up) {
   storageSet("net.up", up ? 1 : 0);
   if (up) signalFlag("net.up");   /* wake the rns boot barrier blocked in waitForFlag */
   fireEvent(up ? NET_EV_UPSTREAM_UP : NET_EV_UPSTREAM_DOWN);
-}
-
-/** Perform a WiFi scan and publish results to wifi.scanned as a JSON array.
- *  Each element: {ssid, bssid, rssi, locked} plus `name` and `detail` — the two
- *  lines a settings row shows, rendered here. A settings surface should be able
- *  to list what the radio can see without knowing that an empty SSID means a
- *  hidden network or which dBm figures deserve which bars. */
-static void publishScanResults() {
-  wifi_scan_config_t scan_config = {};
-  esp_err_t e = esp_wifi_scan_start(&scan_config, true);
-  if (e != ESP_OK) { info("scan failed: %s\n", esp_err_to_name(e)); return; }
-  uint16_t ap_count = 0;
-  esp_wifi_scan_get_ap_num(&ap_count);
-  if (ap_count == 0) {
-    storageSetTree("wifi.scanned", cJSON_CreateArray());
-    return;
-  }
-  wifi_ap_record_t* ap_list = (wifi_ap_record_t*)gp_alloc(ap_count * sizeof(wifi_ap_record_t));
-  if (!ap_list) return;
-  esp_wifi_scan_get_ap_records(&ap_count, ap_list);
-
-  /* Sort by RSSI descending (strongest first) */
-  for (int i = 0; i < ap_count - 1; i++)
-    for (int j = i + 1; j < ap_count; j++)
-      if (ap_list[j].rssi > ap_list[i].rssi) {
-        wifi_ap_record_t tmp = ap_list[i];
-        ap_list[i] = ap_list[j];
-        ap_list[j] = tmp;
-      }
-
-  cJSON* arr = cJSON_CreateArray();
-  for (int i = 0; i < ap_count; i++) {
-    /* One row per SSID: the list is RSSI-sorted, so the first occurrence is
-     * the loudest AP of that network — weaker same-SSID APs are dropped.
-     * Empty SSIDs (hidden networks) are distinct APs, keep them all. */
-    if (ap_list[i].ssid[0]) {
-      bool dup = false;
-      for (int j = 0; j < i && !dup; j++)
-        dup = strcmp((const char*)ap_list[j].ssid, (const char*)ap_list[i].ssid) == 0;
-      if (dup) continue;
-    }
-    cJSON* obj = cJSON_CreateObject();
-    cJSON_AddStringToObject(obj, "ssid", (const char*)ap_list[i].ssid);
-    char bssid[18];
-    snprintf(bssid, sizeof(bssid), "%02x:%02x:%02x:%02x:%02x:%02x",
-             ap_list[i].bssid[0], ap_list[i].bssid[1], ap_list[i].bssid[2],
-             ap_list[i].bssid[3], ap_list[i].bssid[4], ap_list[i].bssid[5]);
-    cJSON_AddStringToObject(obj, "bssid", bssid);
-    cJSON_AddNumberToObject(obj, "rssi", ap_list[i].rssi);
-    bool locked = ap_list[i].authmode != WIFI_AUTH_OPEN;
-    cJSON_AddNumberToObject(obj, "locked", locked ? 1 : 0);
-    cJSON_AddStringToObject(obj, "name",
-                            ap_list[i].ssid[0] ? (const char*)ap_list[i].ssid : "(hidden)");
-    int r = ap_list[i].rssi;
-    const char* bars = r >= -55 ? "\xE2\x96\x82\xE2\x96\x84\xE2\x96\x86\xE2\x96\x88"
-                     : r >= -65 ? "\xE2\x96\x82\xE2\x96\x84\xE2\x96\x86"
-                     : r >= -75 ? "\xE2\x96\x82\xE2\x96\x84"
-                                : "\xE2\x96\x82";
-    char detail[48];
-    snprintf(detail, sizeof(detail), "%s  %d dBm%s", bars, r, locked ? "  \xF0\x9F\x94\x92" : "");
-    cJSON_AddStringToObject(obj, "detail", detail);
-    cJSON_AddItemToArray(arr, obj);
-  }
-  free(ap_list);
-  storageSetTree("wifi.scanned", arr);
 }
 
 static void staNetPublishStatus();
@@ -1628,6 +1610,15 @@ static void radioOff() {
 static volatile bool cmdDisconnect = false;
 static volatile uint32_t lastBrowserScanMs = 0;
 
+/* `net scan` asks for a scan and waits for the answer. The radio belongs to
+ * this task — a scan started from the CLI task would land in the middle of
+ * whatever the state machine was doing with it, and esp_wifi_scan_stop() at the
+ * top of a scan is exactly the kind of thing two tasks must not both do. So the
+ * request goes in and a generation comes back out: the CLI waits for the number
+ * to move, then prints the cache the scan has just fed. */
+static volatile bool     scanReq = false;
+static volatile uint32_t scanGen = 0;
+
 static void netCmdHandler(TaskHandle_t, const void* data, size_t len) {
   if (len < 1) return;
   uint8_t cmd = *(const uint8_t*)data;
@@ -1636,6 +1627,7 @@ static void netCmdHandler(TaskHandle_t, const void* data, size_t len) {
     case NET_CMD_DOWN:       cmdDown = true; break;
     case NET_CMD_FORCE_DOWN: cmdForceDown = true; break;
     case NET_CMD_DISCONNECT: cmdDisconnect = true; break;
+    case NET_CMD_SCAN:       scanReq = true; break;
     case NET_CMD_CONNECT:
       if (len >= 2) cmdConnectIdx = ((const uint8_t*)data)[1];
       break;
@@ -2034,6 +2026,31 @@ static void netTaskFn(void* arg) {
       continue;
     }
 
+    /* `net scan` asked for one, wherever the radio happens to be. ST_OFF brings
+     * it up for the scan and puts it straight back; ST_AP goes APSTA so the AP
+     * keeps serving its clients while the scan runs, exactly as the browser's
+     * beat does. A hit is NOT acted on — asking what is in earshot is not
+     * asking to be moved onto it, and the state machine's own search is the one
+     * thing allowed to change which network this node is on.
+     *
+     * The generation moves on every path, a failed scan included: the CLI is
+     * parked on it and must never be left there. */
+    if (scanReq) {
+      scanReq = false;
+      if (state == ST_OFF) {
+        pmLockAcquire(netDeepLock);
+        wifiHwStart(WIFI_MODE_STA);
+        wifiScanRun(false);
+        radioOff();
+      } else {
+        if (state == ST_AP) esp_wifi_set_mode(WIFI_MODE_APSTA);
+        wifiScanRun(false);
+        if (state == ST_AP) esp_wifi_set_mode(WIFI_MODE_AP);
+      }
+      scanGen = scanGen + 1;
+      continue;
+    }
+
     /* Periodic radio-down rescan (see offRescan above). One pass: radio up,
      * WIFI_SCANS_PER_CYCLE scans, connect on a hit, radio straight back off
      * on a miss. */
@@ -2044,8 +2061,8 @@ static void netTaskFn(void* arg) {
       pmLockAcquire(netDeepLock);
       setDhcpHostname();
       wifiHwStart(WIFI_MODE_STA);
-      int idx = scanForKnown();
-      for (int s = 1; idx < 0 && s < WIFI_SCANS_PER_CYCLE; s++) idx = scanForKnown();
+      int idx = wifiScanRun(true);
+      for (int s = 1; idx < 0 && s < WIFI_SCANS_PER_CYCLE; s++) idx = wifiScanRun(true);
       if (idx >= 0 && connectSta(idx)) {
         state = ST_STA_CONNECTED;
         doUp(state);
@@ -2085,7 +2102,7 @@ static void netTaskFn(void* arg) {
       lastBrowserScanMs = millis();
       if (state == ST_AP)
         esp_wifi_set_mode(WIFI_MODE_APSTA);
-      publishScanResults();
+      wifiScanRun(false);
       if (state == ST_AP)
         esp_wifi_set_mode(WIFI_MODE_AP);
     }
@@ -2093,7 +2110,7 @@ static void netTaskFn(void* arg) {
     switch (state) {
       case ST_OFF: break;
       case ST_SCANNING: {
-        int idx = scanForKnown();
+        int idx = wifiScanRun(true);
         if (idx >= 0) {
           scanMisses = 0;
           /* A known network is in range. Give it WIFI_CONNECT_RETRIES attempts
@@ -2133,7 +2150,7 @@ static void netTaskFn(void* arg) {
           /* Clear the residual STA config. When the AP we were on vanishes
            * (e.g. A20 goes out of range) its SSID stays loaded in the driver,
            * which keeps churning on it and wedges the rescan below — so
-           * scanForKnown() never matches an alternate visible network and we
+           * wifiScanRun() never matches an alternate visible network and we
            * time out into AP mode until a reboot. Nulling the target restores a
            * clean scan; WIFI_STORAGE_RAM keeps it RAM-only, so connectSta()
            * rewrites it on the next real connect. */
@@ -2187,7 +2204,7 @@ static void netTaskFn(void* arg) {
             /* Non-disruptive scan: APSTA keeps AP running for connected clients */
             esp_wifi_set_mode(WIFI_MODE_APSTA);
             delay(100);
-            int idx = scanForKnown();
+            int idx = wifiScanRun(true);
             if (idx >= 0) {
               /* Found a known network — tear down AP and connect */
               fireEvent(NET_EV_DOWN);
@@ -2450,6 +2467,141 @@ static void hostnameCliCmd(const char* args) {
     cliPrintf("hostname set to '%s' (applies on next reconnect)\n", argv[0]);
 }
 
+/* ── waiting on the net task, from the CLI ─────────────────────────────────
+ *
+ * Three verbs hand work to the net task and have nothing worth saying until it
+ * lands: `net scan` waits for the scan, `net add` and `net join` wait for the
+ * connect attempt to reach a conclusion. Both print a dot a second, so a wait
+ * reads as a wait rather than as a hang.
+ *
+ * **Ctrl-C abandons the WAIT, never the work.** The scan and the connect belong
+ * to the net task and run to their own conclusion either way — which is what
+ * makes the abort free to take, and why the message says so. `cliReadRaw`
+ * doubles as the sleep and the keystroke check; a session with nothing to read
+ * from (a script, cron) gets a plain sleep and no dots to abort.
+ *
+ * Returns false when the user asked to stop waiting. */
+static bool cliWaitTick(uint32_t* lastDot) {
+  char c;
+  int n = cliReadRaw(&c, 1, 100);
+  if (n > 0 && (c == 0x03 || c == 0x04)) return false;   /* Ctrl-C / Ctrl-D */
+  if (n < 0) delay(100);                                 /* no reader; just wait */
+  if (millis() - *lastDot >= 1000) { *lastDot = millis(); cliPrintf("."); }
+  return true;
+}
+
+/* An unanswered request is a bug somewhere, not a state to sit in: every path
+ * through the task's scan block moves the generation, and a connect attempt
+ * ends in connected / AP / off. These are the backstops for the day one of
+ * those stops being true. */
+#define NET_CLI_SCAN_WAIT_MS     20000
+#define NET_CLI_CONNECT_WAIT_MS  90000
+
+/* Scan now, so what gets printed is the neighbourhood as it is rather than as
+ * it was at boot. The CACHE is still what `net scan` prints — it is every
+ * sighting since boot, and one scan is one look — this only makes sure the
+ * newest look is in it first. */
+static void netScanNow(void) {
+  if (!netHandle) return;
+  uint32_t gen = scanGen;
+  uint8_t cmd = NET_CMD_SCAN;
+  itsSendAuxByTaskHandle(netHandle, NET_CMD_PORT, &cmd, 1, pdMS_TO_TICKS(100));
+  cliPrintf("scanning ");
+  uint32_t start = millis(), lastDot = start;
+  while (scanGen == gen) {
+    if (millis() - start >= NET_CLI_SCAN_WAIT_MS) { cliPrintf(" no answer\n\n"); return; }
+    if (!cliWaitTick(&lastDot)) { cliPrintf(" (the scan itself is still running)\n\n"); return; }
+  }
+  cliPrintf("\n\n");
+}
+
+/* Wait out the connect attempt netUp() has just asked for. Two phases, because
+ * netUp() is a request and not the thing itself: the task has to pick it up —
+ * until it does, the state still reads as whatever it was, and a naive wait
+ * would return before anything had happened — and then the search has to end,
+ * which it does by connecting, by falling back to this node's own AP, or by
+ * turning the radio off. */
+static void netWaitForConnect(void) {
+  cliPrintf("connecting ");
+  uint32_t start = millis(), lastDot = start;
+  bool started = false;
+  for (;;) {
+    if (wifiState == ST_SCANNING) started = true;
+    else if (started || millis() - start >= 3000) break;
+    if (millis() - start >= NET_CLI_CONNECT_WAIT_MS) {
+      cliPrintf(" still trying\n\n");
+      return;
+    }
+    if (!cliWaitTick(&lastDot)) {
+      cliPrintf(" (still connecting in the background)\n\n");
+      return;
+    }
+  }
+  cliPrintf("\n\n");
+}
+
+/* `net` with no verb: what this node's WiFi is doing right now. Its own
+ * function because the verbs that change that state print it when they are
+ * done — the answer to "did it work" is the same answer as "what is it doing",
+ * and there should be one place that gives it. */
+static void netCliStatus(void) {
+  /* Four states: down, connecting, up, going down */
+  if (wifiState == ST_OFF) { cliPrintf("wifi: down\n"); return; }
+  if (wifiState == ST_SCANNING) { cliPrintf("wifi: connecting\n"); return; }
+  bool goingDown = !wantUp();
+
+  uint32_t upSecs = (millis() - connectTimeMs) / 1000;
+  char elapsed[32];
+  fmtElapsed(upSecs, elapsed, sizeof(elapsed));
+
+  if (wifiState == ST_AP) {
+    cliPrintf("wifi: %s (AP) - %s\n\n", goingDown ? "going down" : "up", elapsed);
+    char ssid[33];
+    storageGetStr("s.net.wifi.ap.ssid", ssid, sizeof(ssid), WIFI_AP_SSID);
+    esp_netif_ip_info_t ip_info;
+    esp_netif_get_ip_info(ap_netif, &ip_info);
+    char ip[16], mask[16];
+    esp_ip4addr_ntoa(&ip_info.ip, ip, sizeof(ip));
+    esp_ip4addr_ntoa(&ip_info.netmask, mask, sizeof(mask));
+    cliPrintf("SSID:    %s\n", ssid);
+    cliPrintf("IP:      %s\n", ip);
+    cliPrintf("netmask: %s\n", mask);
+  } else {
+    cliPrintf("wifi: %s - %s\n\n", goingDown ? "going down" : "up", elapsed);
+    wifi_ap_record_t ap_info;
+    const char* ssid = "?";
+    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) ssid = (const char*)ap_info.ssid;
+    esp_netif_ip_info_t ip_info;
+    esp_netif_get_ip_info(sta_netif, &ip_info);
+    char ip[16], gw[16], mask[16];
+    esp_ip4addr_ntoa(&ip_info.ip, ip, sizeof(ip));
+    esp_ip4addr_ntoa(&ip_info.gw, gw, sizeof(gw));
+    esp_ip4addr_ntoa(&ip_info.netmask, mask, sizeof(mask));
+    esp_netif_dns_info_t dns1 = {}, dns2 = {};
+    char dns1s[16], dns2s[16];
+    esp_netif_get_dns_info(sta_netif, ESP_NETIF_DNS_MAIN, &dns1);
+    esp_ip4addr_ntoa(&dns1.ip.u_addr.ip4, dns1s, sizeof(dns1s));
+    esp_netif_get_dns_info(sta_netif, ESP_NETIF_DNS_BACKUP, &dns2);
+    esp_ip4addr_ntoa(&dns2.ip.u_addr.ip4, dns2s, sizeof(dns2s));
+    cliPrintf("SSID:    %s\n", ssid);
+    cliPrintf("IP:      %s\n", ip);
+    cliPrintf("router:  %s\n", gw);
+    cliPrintf("netmask: %s\n", mask);
+    if (strcmp(dns2s, "0.0.0.0") != 0)
+      cliPrintf("DNS:     %s, %s\n", dns1s, dns2s);
+    else
+      cliPrintf("DNS:     %s\n", dns1s);
+    char ip6[INET6_ADDRSTRLEN], ip6ll[INET6_ADDRSTRLEN];
+    staIp6Strings(ip6, sizeof(ip6), ip6ll, sizeof(ip6ll));
+    if (ip6[0])   cliPrintf("IPv6:    %s\n", ip6);
+    if (ip6ll[0]) cliPrintf("IPv6 LL: %s\n", ip6ll);
+  }
+  char inBuf[16], outBuf[16];
+  fmtSize(trafficIn, inBuf, sizeof(inBuf));
+  fmtSize(trafficOut, outBuf, sizeof(outBuf));
+  cliPrintf("traffic: in %s, out %s\n", inBuf, outBuf);
+}
+
 static void netCliCmd(const char* args) {
     if (strcmp(args, "help") == 0) { cliPrintf("%-*s WiFi status; list/scan/up/down/add/join/delete\n", CLI_HELP_COL, "net [...]"); return; }
     if (cliWantsHelp(args)) {
@@ -2458,7 +2610,9 @@ static void netCliCmd(const char* args) {
         cliPrintf("%-*s save a WiFi network (quote spaces)\n", CLI_HELP_COL, "net add <ssid> [pass]");
         cliPrintf("%-*s force-join a known network\n", CLI_HELP_COL, "net join <ssid>");
         cliPrintf("%-*s remove + disconnect\n",     CLI_HELP_COL, "net delete <ssid>");
-        cliPrintf("%-*s access points seen this boot, loudest first\n", CLI_HELP_COL, "net scan");
+        cliPrintf("%-*s scan now, then list every AP seen this boot\n", CLI_HELP_COL, "net scan");
+        cliPrintf("%-*s add/join/scan wait for the result; Ctrl-C stops waiting,\n", CLI_HELP_COL, "");
+        cliPrintf("%-*s not the scan or the connect itself\n", CLI_HELP_COL, "");
         cliPrintf("%-*s onboarding output: state/ssid/ip/hostname\n", CLI_HELP_COL, "net -O");
         cliPrintf("%-*s onboarding output: count + one ap= per network\n", CLI_HELP_COL, "net scan -O");
         return;
@@ -2496,6 +2650,12 @@ static void netCliCmd(const char* args) {
 
     if (strcmp(args, "scan") == 0 || strcmp(args, "scan -O") == 0) {
         const bool onboarding = (args[4] != '\0');
+        /* The human form scans first, so what it prints is the neighbourhood as
+         * it is. `-O` deliberately does not: it is the onboarding contract, read
+         * over the framed channel by a caller holding a two-second timeout that
+         * a full sweep of the band does not fit inside. It answers from the
+         * cache, free and instantly, which is what its readers ask it for. */
+        if (!onboarding) netScanNow();
         int order[SCAN_CACHE_MAX];
         int n = 0;
         for (int i = 0; i < scanSeenCount; i++) {
@@ -2580,6 +2740,8 @@ static void netCliCmd(const char* args) {
             cliPrintf("joining '%s'…\n", ssid);
             netDown(true);
             netUp();
+            netWaitForConnect();
+            netCliStatus();
         }
         return;
     }
@@ -2599,6 +2761,8 @@ static void netCliCmd(const char* args) {
         cliPrintf("joining '%s'…\n", ssid);
         netDown(true);
         netUp();
+        netWaitForConnect();
+        netCliStatus();
         return;
     }
 
@@ -2631,61 +2795,7 @@ static void netCliCmd(const char* args) {
 
     if (*args) { cliPrintf("usage: net [up|down|down!|list|scan|add|join|delete]\n"); return; }
 
-    /* Show status — four states: down, connecting, up, going down */
-    if (wifiState == ST_OFF) { cliPrintf("wifi: down\n"); return; }
-    if (wifiState == ST_SCANNING) { cliPrintf("wifi: connecting\n"); return; }
-    bool goingDown = !wantUp();
-
-    uint32_t upSecs = (millis() - connectTimeMs) / 1000;
-    char elapsed[32];
-    fmtElapsed(upSecs, elapsed, sizeof(elapsed));
-
-    if (wifiState == ST_AP) {
-        cliPrintf("wifi: %s (AP) - %s\n\n", goingDown ? "going down" : "up", elapsed);
-        char ssid[33];
-        storageGetStr("s.net.wifi.ap.ssid", ssid, sizeof(ssid), WIFI_AP_SSID);
-        esp_netif_ip_info_t ip_info;
-        esp_netif_get_ip_info(ap_netif, &ip_info);
-        char ip[16], mask[16];
-        esp_ip4addr_ntoa(&ip_info.ip, ip, sizeof(ip));
-        esp_ip4addr_ntoa(&ip_info.netmask, mask, sizeof(mask));
-        cliPrintf("SSID:    %s\n", ssid);
-        cliPrintf("IP:      %s\n", ip);
-        cliPrintf("netmask: %s\n", mask);
-    } else {
-        cliPrintf("wifi: %s - %s\n\n", goingDown ? "going down" : "up", elapsed);
-        wifi_ap_record_t ap_info;
-        const char* ssid = "?";
-        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) ssid = (const char*)ap_info.ssid;
-        esp_netif_ip_info_t ip_info;
-        esp_netif_get_ip_info(sta_netif, &ip_info);
-        char ip[16], gw[16], mask[16];
-        esp_ip4addr_ntoa(&ip_info.ip, ip, sizeof(ip));
-        esp_ip4addr_ntoa(&ip_info.gw, gw, sizeof(gw));
-        esp_ip4addr_ntoa(&ip_info.netmask, mask, sizeof(mask));
-        esp_netif_dns_info_t dns1 = {}, dns2 = {};
-        char dns1s[16], dns2s[16];
-        esp_netif_get_dns_info(sta_netif, ESP_NETIF_DNS_MAIN, &dns1);
-        esp_ip4addr_ntoa(&dns1.ip.u_addr.ip4, dns1s, sizeof(dns1s));
-        esp_netif_get_dns_info(sta_netif, ESP_NETIF_DNS_BACKUP, &dns2);
-        esp_ip4addr_ntoa(&dns2.ip.u_addr.ip4, dns2s, sizeof(dns2s));
-        cliPrintf("SSID:    %s\n", ssid);
-        cliPrintf("IP:      %s\n", ip);
-        cliPrintf("router:  %s\n", gw);
-        cliPrintf("netmask: %s\n", mask);
-        if (strcmp(dns2s, "0.0.0.0") != 0)
-            cliPrintf("DNS:     %s, %s\n", dns1s, dns2s);
-        else
-            cliPrintf("DNS:     %s\n", dns1s);
-        char ip6[INET6_ADDRSTRLEN], ip6ll[INET6_ADDRSTRLEN];
-        staIp6Strings(ip6, sizeof(ip6), ip6ll, sizeof(ip6ll));
-        if (ip6[0])   cliPrintf("IPv6:    %s\n", ip6);
-        if (ip6ll[0]) cliPrintf("IPv6 LL: %s\n", ip6ll);
-    }
-    char inBuf[16], outBuf[16];
-    fmtSize(trafficIn, inBuf, sizeof(inBuf));
-    fmtSize(trafficOut, outBuf, sizeof(outBuf));
-    cliPrintf("traffic: in %s, out %s\n", inBuf, outBuf);
+    netCliStatus();
 }
 
 /* Module config version. Bump when adding/changing defaults. See duckdns.cpp.
