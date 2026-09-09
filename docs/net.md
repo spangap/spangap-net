@@ -174,18 +174,18 @@ default MAC).
 | `wifi.ap.{ssid,ip,netmask,up}` | AP detail when active. |
 | `wifi.scanned` | JSON array of nearby networks (`{ssid,bssid,rssi,locked}`, strongest first), rewritten by **every** scan whatever asked for it — the connect search, the browser beat, `net scan` — so it is always the radio's most recent look around. One row per SSID — when several APs serve the same network only the loudest is listed; hidden (empty-SSID) APs are kept individually. |
 
-### Command sentinels (write to trigger; net clears them)
+### Command keys (write to trigger; net clears them)
 
 | Key | Action |
 |---|---|
 | `wifi.scan` | `1` re-scans every 20 s while set, keeping `wifi.scanned` fresh. **The re-scan runs while associated too**, and a scan takes the one radio off its channel — so a UI that arms this key owns clearing it, and one left set is a join/rejoin cycle for as long as it stands. `wifi.scanned` is published by every scan regardless of this key; what the key buys is a scan on a beat rather than only when something else needed one. |
-| `wifi.connect` | `<idx>` joins the known network at that array index. Like every sentinel here it is **cleared by net as it takes the command**, and a clear arrives at subscribers as an empty value — so a reader of this key must ignore an empty one rather than let `atoi` turn it into index 0. |
+| `wifi.connect` | `<idx>` joins the known network at that array index. Like every command key here it is **cleared by net as it takes the command**, and a clear arrives at subscribers as an empty value — so a reader of this key must ignore an empty one rather than let `atoi` turn it into index 0. |
 | `wifi.disconnect` | `1` drops the current STA and returns to AP. |
 | `wifi.cmd.add` | `"<ssid>\t<pass>"` adds (or updates) a known network and joins it. |
 | `wifi.cmd.del` | `"<idx>"` removes a known network (array-correct shift). |
 
 The browser WiFi panel rewrites `s.net.wifi.nets[]` directly; the on-device LCD
-pane drives the `wifi.cmd.*` sentinels — both surfaces converge on the same
+pane drives the `wifi.cmd.*` command keys — both surfaces converge on the same
 stored networks.
 
 **A factory-reset boot keeps the radio down.** `netInit` leaves `rtcWantUp`
@@ -301,7 +301,7 @@ error removes the partial file.
   access-point configuration appear on both — a browserless device can do
   everything a browser can.
 - Nothing about them is hand-written on either side. The known networks are a
-  collection whose every mutation goes through a `wifi.net.*` sentinel, and net
+  collection whose every mutation goes through a `wifi.net.*` command key, and net
   publishes the state, the signal quality and the scan rows as finished text —
   see [net-internals](net-internals.md#8-front-ends).
 

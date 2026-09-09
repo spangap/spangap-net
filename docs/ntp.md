@@ -63,10 +63,10 @@ gained the zone resolves it on that boot.
 
 The hostname / timezone / NTP-server fields surface in the generated **System**
 settings pane. The timezone is a `timezone:` form field behind the validating
-`ntp.tz.set` sentinel: the browser renders it as a type-to-filter picker over
+`ntp.tz.set` command key: the browser renders it as a type-to-filter picker over
 its own Intl zone list, the LCD as region + zone dropdowns over the built-in
 zone table — the yaml states no list and neither surface fetches the other's.
-The pane also carries a **Sync time now** button (the `ntp.sync.now` sentinel)
+The pane also carries a **Sync time now** button (the `ntp.sync.now` command key)
 and a **Last NTP sync** row (`ntp.last_sync`).
 
 ### Runtime (ephemeral)
@@ -76,7 +76,7 @@ and a **Last NTP sync** row (`ntp.last_sync`).
 | `sys.time.valid` | `1` once the clock is past 2025-01-01. |
 | `ntp.last_sync` | Local-time string of the last successful SNTP sync this boot. |
 
-### Command sentinels (read, self-clearing)
+### Command keys (read, self-clearing)
 
 | Key | Action |
 |---|---|

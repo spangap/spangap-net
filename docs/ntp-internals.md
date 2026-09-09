@@ -35,7 +35,7 @@ in `ntpEngineApply` is `static` to avoid a dangling pointer.
 when `app_main` returns**. A `storageSubscribeChanges` registered there would be
 orphaned — the callback never fires, and storage logs a "notify drop" into the
 freed TCB. So every subscription this module owns — `sys.time.ext`, the
-`ntp.tz.set` form sentinel, the `ntp.sync.now` button sentinel — is registered
+`ntp.tz.set` form command key, the `ntp.sync.now` button command key — is registered
 **lazily in `ntpOnPoll`**, on the net task (which lives and polls), guarded by a
 `static bool subDone`. That also puts the handlers in the one context allowed
 to touch the SNTP engine and to run the file-parsing zone resolve. The
@@ -59,7 +59,7 @@ later firmware whose table gained the zone resolves it on that boot.
 
 `ntpOnCfg` on `s.ntp.tz` just calls `ntpApplyTimezone()` — the browser writes
 `s.ntp.tz` directly on first connect; the settings form goes through the
-validating `ntp.tz.set` sentinel instead, which rejects unresolvable names
+validating `ntp.tz.set` command key instead, which rejects unresolvable names
 outright.
 
 `ntpInit()` ends by calling `updateTimeValid()` then `ntpApplyTimezone()`, so the
@@ -85,7 +85,7 @@ clears the key.
 - **All SNTP start/stop must stay on the net task.** `ntpEngineApply` is only
   ever reached from net-task callbacks; calling `esp_sntp_init`/`stop` from
   another task races the engine. `ntpInhibit` is the cross-task entry — it sets a
-  flag, nothing more. The `ntp.sync.now` sentinel (`esp_sntp_restart` is a
+  flag, nothing more. The `ntp.sync.now` command key (`esp_sntp_restart` is a
   stop+init) is safe only because its subscription is registered from the net
   task.
 - **Never setenv an unresolved zone name.** `TZ` takes POSIX strings; newlib

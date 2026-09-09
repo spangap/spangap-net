@@ -187,7 +187,7 @@ can't override an explicit `enable=0`. `netUp()` is a no-op while disabled.
 `netInit()` re-seeds `rtcWantUp` from enable on cold boot, and forces it false on
 any boot where enable is 0 (the change handler may not have run yet this boot).
 
-## 5. Config / sentinel subscriptions
+## 5. Config / command key subscriptions
 
 Set up inside the task. `s.net.` → re-open endpoints + `NET_EV_CFG_CHANGED`.
 Specific prefixes are **re-broadcast** as `NET_EV_CFG_CHANGED` for module helpers
@@ -266,7 +266,7 @@ That is what makes one description enough for both surfaces:
   (`staNetNextId`) and kept across reorders and deletes, because the collection
   addresses items by it and every index is invalidated by the removals it would
   otherwise name. `staNetEnsureIds()` backfills a store written before ids
-  existed. `wifi.connect` still takes an index — the sentinel translates.
+  existed. `wifi.connect` still takes an index — the command key translates.
 - **Validation** is `staNetRejection()`, one function, and its verdict reaches
   the operator as text on `wifi.net.error`. A manual IP without a netmask is
   refused there rather than by a rule written twice in two UIs.
