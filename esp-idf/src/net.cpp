@@ -1456,7 +1456,7 @@ static bool connectSta(int idx) {
     char dns_str[16];
     esp_ip4addr_ntoa(&dns_info.ip.u_addr.ip4, dns_str, sizeof(dns_str));
     /* Report the configured hostname too (empty if unset): it is what
-     * <hostname>.local resolves to, so a browser flasher can address the device
+     * <hostname>.local resolves to, so flashmon can address the device
      * by its real name instead of guessing the default. */
     char hostname[32];
     storageGetStr("s.net.hostname", hostname, sizeof(hostname), "");
@@ -2619,7 +2619,7 @@ static void netCliCmd(const char* args) {
     }
 
     /* Onboarding output — the machine-readable contract, `key=value` lines and
-     * nothing else. A flasher reads these to drive provisioning; the human
+     * nothing else. flashmon reads these to drive provisioning; the human
      * status display below is free to change without breaking it. */
     if (strcmp(args, "-O") == 0) {
         cliPrintf("state=%s\n", wifiState == ST_SCANNING      ? "connecting"

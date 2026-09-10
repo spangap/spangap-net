@@ -261,7 +261,7 @@ way, which is what makes the abort free to take.
 ### `-O`, onboarding output
 
 `net -O` and `net scan -O` print machine-readable `key=value` lines and nothing
-else — the contract a flasher provisions against. See
+else — the contract flashmon provisions against. See
 [onboarding-output.md](../../spangap-core/docs/onboarding-output.md) for the
 format and its rules; the keys are:
 
