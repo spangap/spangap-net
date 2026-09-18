@@ -15,7 +15,14 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#if CONFIG_IDF_TARGET_LINUX
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#else
 #include <lwip/sockets.h>
+#endif
 #include <fcntl.h>
 
 

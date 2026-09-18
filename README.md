@@ -13,6 +13,12 @@ has three sides: the firmware (the `net` task and the TLS/NTP/mDNS helpers it
 hosts), a browser WiFi panel, and an on-device LVGL WiFi pane — a device with no
 browser can still join a network.
 
+The socket relay is separate from the radio that carries it: `src/net_relay.cpp`
+holds the event bus, the listen sockets and the byte proxy, and a link backend
+drives it — WiFi on a chip (`src/net.cpp`), the host's loopback on ESP-IDF's
+Linux target (`src/host/`). That second backend is there for the simulated
+testbed — see `reticulous/sim/`.
+
 ## Functions
 
 | Function | Operator guide | What it is |

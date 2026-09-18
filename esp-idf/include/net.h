@@ -8,8 +8,38 @@
 #define SPANGAP_NET_H
 
 #include <stddef.h>
+#include <stdint.h>
+#include "sdkconfig.h"
+
+#if CONFIG_IDF_TARGET_LINUX
+/* The host's own sockets, and the two lwIP spellings the platform's code uses
+ * for an address written into a connect payload or read back out of one. An
+ * `ip_addr_t` here is a v4 address and nothing else: the relay hands a peer's
+ * `sockaddr_in` straight across. */
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <string.h>
+
+typedef struct in_addr ip_addr_t;
+
+static inline bool ip_addr_isloopback(const ip_addr_t* a) {
+    return a && (ntohl(a->s_addr) >> 24) == 127;
+}
+static inline char* ipaddr_ntoa(const ip_addr_t* a) {
+    static char buf[INET_ADDRSTRLEN];
+    if (!a || !inet_ntop(AF_INET, a, buf, sizeof buf)) buf[0] = '\0';
+    return buf;
+}
+static inline void ip_addr_set_ip4_u32_val(ip_addr_t& a, uint32_t v) {
+    a.s_addr = v;
+}
+#else
 #include <lwip/ip_addr.h>
 #include <lwip/sockets.h>
+#endif
 
 /* Compiler-define fallbacks for AP mode (survive factory reset).
  * AP SSID defaults to the project name (CONFIG_SPANGAP_PROJECT_NAME) so a
