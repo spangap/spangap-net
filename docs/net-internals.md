@@ -94,6 +94,15 @@ fds, then:
    whole net task. Dead-peer detection is asymmetric and load-bearing — see
    pitfalls.
 
+   **A hangup is discovered even while the socket is out of the read set.** A
+   peer that has closed is gone whether or not there is anywhere to put its
+   bytes, and backpressure is exactly the case where nothing would ever read it
+   again: the socket sits in `CLOSE-WAIT` holding a client slot for as long as
+   the owning task stays backed up, and enough of them stop the endpoint
+   accepting anyone at all. So a backpressured raw socket gets a probe of its
+   own, on the `select()` timeout's beat — `recv(…, MSG_PEEK)`, which consumes
+   nothing, so the data still arrives in order once there is room for it.
+
 `netRegisterCorePorts()` registers `cli`/`log` by resolving their tasks with
 `xTaskGetHandle` (ITS names them `"cli"` / `"log"`); the dependency runs
 net → core, never the reverse. Their port keys (`s.net.cli_port` /

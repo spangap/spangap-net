@@ -442,6 +442,22 @@ void netPollOnce() {
          * note above; this covers the tlsBytesAvail path and space shrinking
          * between the FD_SET pass and here). */
         size_t space = itsSpacesAvailable(c.itsHandle);
+        /* A peer that has hung up is gone whether or not we have anywhere to
+         * put its bytes. Reading is what discovers that, and a backpressured
+         * socket is deliberately kept out of the read set — so without this it
+         * is never discovered at all: the socket sits in CLOSE-WAIT holding a
+         * client slot for as long as the owning task stays backed up, and
+         * enough of those stop the endpoint accepting anyone. Hence a probe of
+         * its own, off the read set, on the select timeout's beat. It consumes
+         * nothing, so the data still arrives in order once there is room. */
+        if (space == 0 && !c.tlsConn) {
+            char probe;
+            int n = recv(c.fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+                netClientClose(c);
+                continue;
+            }
+        }
         if (canRecv && space > 0) {
             size_t want = space < 4096 ? space : 4096;   /* netProxyBuf size */
             int n = c.tlsConn ? tlsRead(c.tlsConn, netProxyBuf, want)
