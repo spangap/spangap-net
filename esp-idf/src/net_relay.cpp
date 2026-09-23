@@ -96,7 +96,7 @@ void setUpstream(bool up) {
 
 /* NET_MAX_ENDPOINTS is net.h's — a caller of netPublicPorts() sizes its array
  * from it. */
-#define NET_MAX_CLIENTS   8
+#define NET_MAX_CLIENTS   16
 
 struct net_endpoint_t {
     TaskHandle_t task;

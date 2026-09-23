@@ -41,7 +41,9 @@ The task owns:
   loop's local `state` is the authority; `wifiState` is synced after each
   transition so observers and `publishWifiStatus()` see the new value.
 - **The endpoint table** (`netEps`, ≤8) and the **client table** (`netClients`,
-  ≤8) — every active relayed connection, inbound or dialed.
+  ≤16) — every active relayed connection, inbound or dialed. Sixteen because a
+  node serving one of its ports to a handful of peers holds that many sockets on
+  its own, beside the web UI's and the CLI's.
 - **The 4 KB PSRAM proxy buffer** (`netProxyBuf`), allocated in task context so
   heap accounting attributes it to net, plus a **per-client 4 KB staging buffer**
   (`net_client_t::txBuf`, allocated once at task start) holding an ITS→socket
