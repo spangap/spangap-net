@@ -59,11 +59,26 @@ ntp; see [ntp-internals.md](ntp-internals.md).)
 ### The single loop
 
 `netTaskFn` blocks in exactly one place per state: `portMAX_DELAY` ITS poll when
-`ST_OFF`, otherwise the `select()`/`vTaskDelay(10ms)` inside `netPollOnce()`.
-That select is **timeout-driven, not notify-driven** — it wakes on socket
-activity or the 10 ms tick, never on a task notify, so `itsPoll`'s auto-boost
-count is never silently dropped. `pmBoostAuto(false)` is released right before
-the block so steady relaying rides the DFS floor instead of pinning 240 MHz.
+`ST_OFF`, otherwise `netRelayWait()` inside `netPollOnce()`. Each link backend
+defines that wait:
+
+- **On a chip** it is lwIP's `select()` with a 10 ms timeout, or
+  `vTaskDelay(10ms)` with no socket open. It is **timeout-driven, not
+  notify-driven** — it wakes on socket activity or the 10 ms tick, never on a
+  task notify, so `itsPoll`'s auto-boost count is never silently dropped, and
+  ITS traffic toward a socket waits at most one period.
+- **On the Linux host target** it is the board's `hwLinuxWait()` (a `select()`
+  that also returns when the task is notified), so the task sleeps until a
+  socket is ready or another task hands it ITS traffic, with no bound. A
+  change under `s.net.` is ITS traffic too: the host backend's task
+  subscribes to it, so the pass it wakes opens or closes the endpoint the
+  change names. The one bound is a second while a client is held back for
+  its owner (`held`, below): the owner makes room without telling the relay,
+  and the probe of a held socket runs on that beat. A build without that
+  board falls back to the chip's wait.
+
+`pmBoostAuto(false)` is released right before the block so steady relaying
+rides the DFS floor instead of pinning 240 MHz.
 
 Command flags (`cmdUp` / `cmdDown` / `cmdConnect…`) are set by the aux handler
 `netCmdHandler` on `NET_CMD_PORT` and consumed at the top of the loop; the public
@@ -103,7 +118,9 @@ fds, then:
    the owning task stays backed up, and enough of them stop the endpoint
    accepting anyone at all. So a backpressured raw socket gets a probe of its
    own, on the `select()` timeout's beat — `recv(…, MSG_PEEK)`, which consumes
-   nothing, so the data still arrives in order once there is room for it.
+   nothing, so the data still arrives in order once there is room for it. The
+   pass tells the backend's wait that it holds such a socket (`held`), so a
+   wait that otherwise lasts for as long as nothing happens has a beat then.
 
 `netRegisterCorePorts()` registers `cli`/`log` by resolving their tasks with
 `xTaskGetHandle` (ITS names them `"cli"` / `"log"`); the dependency runs
@@ -175,8 +192,8 @@ The same rescan covers `s.net.wifi.ap.enable = 0` (AP disabled) after a fruitles
 `ST_SCANNING` window. Clearing it while the AP is live (the settings toggle)
 drops it on the next `ST_AP` iteration without spending the window —
 `rtcApWindowUsed` stays clear, so re-enabling later can start it again. `radioOff()` (stop + deinit + PM-lock release) is also
-what the `ST_SCANNING` → `ST_OFF` fallbacks use — they previously left the
-radio initialized and drawing power in "OFF".
+what the `ST_SCANNING` → `ST_OFF` fallbacks use, so a radio in "OFF" is not
+left initialized and drawing power.
 
 `setUpstream(bool)` is idempotent (fires only on real transitions), writes the
 ephemeral `net.up` storage key the rns boot barrier waits on, and fires

@@ -71,7 +71,9 @@ enum {
     NET_EV_UPSTREAM_DOWN, /* STA leaving connected state. arg = NULL. Fires on
                              disconnect, reconnect-loop, or transition to AP-only. */
     NET_EV_CFG_CHANGED,   /* config key changed. arg = key name */
-    NET_EV_POLL,          /* periodic (~10ms when connected). arg = NULL */
+    NET_EV_POLL,          /* once per relay pass: ~10ms when connected on a chip,
+                             each wake and at least once a second on the Linux
+                             host target. arg = NULL */
     NET_EV_PORTS_CHANGED, /* a public-facing listen socket opened or closed, or a
                              registrant changed its publicFacing flag. arg = NULL.
                              Fired from the endpoint-open pass, which runs on the

@@ -123,7 +123,7 @@ header.
 | `NET_EV_UPSTREAM_UP` | STA associated to a real network (internet reachable). AP-only does **not** fire it. | Level-replayed. |
 | `NET_EV_UPSTREAM_DOWN` | STA leaving connected (disconnect / reconnect loop / drop to AP-only). | Edge-only. |
 | `NET_EV_CFG_CHANGED` | A watched config key changed; `arg` is the key name. | Edge-only. |
-| `NET_EV_POLL` | Periodic, ~10 ms while connected. | Edge-only. |
+| `NET_EV_POLL` | Once per relay pass: ~10 ms while connected on a chip; on the Linux host target, on each wake — a socket, ITS traffic, a change under `s.net.` — and once a second while a client is held back for its owner. | Edge-only. |
 | `NET_EV_PORTS_CHANGED` | A public-facing listen socket opened or closed, or a registrant flipped `publicFacing`. Fires from the endpoint-open pass — the net task, or whoever wrote an `s.net.*` key — so a handler defers its work instead of doing it inline. | Edge-only. |
 
 ## Storage variables

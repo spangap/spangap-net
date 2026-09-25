@@ -30,6 +30,28 @@ extern "C" __attribute__((weak)) const char* hwLinuxBindAddr(void) { return "127
 static TaskHandle_t      s_task = nullptr;
 static SemaphoreHandle_t s_ready = nullptr;
 
+/* The board's descriptor wait: select() that also returns when this task is
+ * notified, which is how ITS traffic toward a socket arrives. Weak and
+ * possibly absent; without it the relay waits the way it does on a chip. */
+extern "C" int hwLinuxWait(int nfds, fd_set* rfds, fd_set* wfds, fd_set* efds,
+                           TickType_t ticks) __attribute__((weak));
+
+/* A socket or ITS traffic, for as long as neither comes: a change under s.net
+ * is ITS traffic too (the subscription in netHostTaskFn), and the pass it wakes
+ * opens and closes the endpoints it names. A second at most while a client is
+ * held for its owner, who makes room without a word to this task. */
+int netRelayWait(int maxFd, fd_set* rfds, fd_set* wfds, bool held) {
+  if (hwLinuxWait)
+    return hwLinuxWait(maxFd + 1, rfds, wfds, nullptr,
+                       held ? pdMS_TO_TICKS(1000) : portMAX_DELAY);
+  if (maxFd >= 0) {
+    struct timeval tv = { 0, 10000 };
+    return select(maxFd + 1, rfds, wfds, NULL, &tv);
+  }
+  vTaskDelay(pdMS_TO_TICKS(10));
+  return 0;
+}
+
 /* The relay's aux command port still has to exist — `net up` and friends send
  * to it — and every command is a no-op on a link that is always up. */
 static void netCmdHandler(TaskHandle_t, const void*, size_t) {}
@@ -37,6 +59,10 @@ static void netCmdHandler(TaskHandle_t, const void*, size_t) {}
 static void netHostTaskFn(void*) {
   netRelayTaskInit();
   itsOnAux(NET_CMD_PORT, netCmdHandler);
+
+  /* Delivered through this task's inbox, so a changed port ends the relay's
+   * wait and the next pass acts on it; the pass itself is the handler. */
+  storageSubscribeChanges("s.net.", ON_CHANGE { (void)key; (void)val; });
 
   /* The core CLI and log endpoints, registered on their tasks' behalf exactly
    * as the WiFi backend does. */
@@ -73,13 +99,6 @@ static void netHostCliCmd(const char* args) {
 }
 
 void netInit() {
-  /* A station has no cable and no serial port to hand around, so its TCP CLI
-   * is the door everything else knocks on — the launcher, the harness, a
-   * person with nc. It is on by default here, where the only way to reach it
-   * is the station's own loopback address. Seeded before the shared config
-   * tree, whose own default for the key is "closed". */
-  storageDefault("s.net.cli_port", 8081);
-
   netInitCommon();
 
   /* Every listener binds this station's own address, so several stations on

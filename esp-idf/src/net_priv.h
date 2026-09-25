@@ -12,6 +12,7 @@
 #include "net.h"
 
 #include <stdint.h>
+#include <sys/select.h>
 
 /* ---- State the relay publishes and a backend sets ---- */
 
@@ -50,9 +51,18 @@ void epOpenAll(void);
 /** Drop every client and every listen socket. */
 void epCloseAll(void);
 
-/** One pass of the relay: poll ITS, refresh the endpoints, select, accept,
- *  proxy both ways, fire NET_EV_POLL. Blocks for at most ten milliseconds. */
+/** One pass of the relay: poll ITS, refresh the endpoints, wait, accept,
+ *  proxy both ways, fire NET_EV_POLL. Blocks for as long as netRelayWait. */
 void netPollOnce(void);
+
+/** The relay's one block point, the link backend's to define: until a socket
+ *  in the sets is ready or the backend's bound passes, then the sets as
+ *  select() leaves them. `maxFd` is -1 when there are no sockets to wait on.
+ *  `held` says a client's socket was left out of the read set because its
+ *  owner has no room: the owner makes room without telling the relay, so a
+ *  backend that otherwise waits for as long as nothing happens bounds this
+ *  wait. */
+int netRelayWait(int maxFd, fd_set* rfds, fd_set* wfds, bool held);
 
 /** The relay's own task-context setup: proxy buffers, the ITS client and
  *  server, the dial port and the registration aux port. Called once from the

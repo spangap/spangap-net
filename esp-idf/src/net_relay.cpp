@@ -334,6 +334,7 @@ void netPollOnce() {
     FD_ZERO(&rfds);
     FD_ZERO(&wfds);
     int maxFd = -1;
+    bool held = false;
 
     for (int i = 0; i < netEpCount; i++) {
         int sfd = netEps[i].serverFd;
@@ -354,32 +355,28 @@ void netPollOnce() {
         /* Read set — backpressure: when the ITS stream toward the owning
          * task is full (owner busy and not draining), leave the socket
          * unread — the kernel buffer fills and TCP flow control throttles
-         * the remote sender. Previously the bytes were read anyway and
-         * handed to itsSend(…, 0) with the result ignored, silently
-         * discarding up-to-4 KB chunks mid-stream and corrupting the
-         * owner's framing. Skipping FD_SET (rather than skipping just the
+         * the remote sender. Reading the bytes anyway and handing them to
+         * itsSend(…, 0) with the result ignored would silently discard
+         * up-to-4 KB chunks mid-stream and corrupt the owner's
+         * framing. Skipping FD_SET (rather than skipping just the
          * recv) keeps select() from returning instantly on the unread fd
          * and spinning the task hot for the whole stall. */
-        if (c.itsHandle >= 0 && itsSpacesAvailable(c.itsHandle) == 0) continue;
+        if (c.itsHandle >= 0 && itsSpacesAvailable(c.itsHandle) == 0) { held = true; continue; }
         FD_SET(c.fd, &rfds);
         if (c.fd > maxFd) maxFd = c.fd;
     }
 
-    /* This is the net task's real block point, and it is timeout-driven, not
-     * notify-driven: select() (and the idle vTaskDelay) wake on socket activity
-     * or the 10ms tick, never on a task notify — so itsPoll's auto-boost is
-     * never dropped here. The connected loop otherwise blocks only in select(),
-     * so a CPU_FREQ_MAX count carried in from the OFF->up notify-wake would pin
-     * 240 MHz for the whole time WiFi stays up. Release it before the block: the
-     * steady proxy path rides the DFS floor (heavy throughput would opt into a
-     * manual pmBoost()). Idempotent — a no-op once the count is gone. */
+    /* This is the net task's real block point, the link backend's to define
+     * (net_priv.h). On a chip it is timeout-driven, not notify-driven: select()
+     * (and the idle vTaskDelay) wake on socket activity or the 10ms tick, never
+     * on a task notify — so itsPoll's auto-boost is never dropped here. The
+     * connected loop otherwise blocks only in it, so a CPU_FREQ_MAX count
+     * carried in from the OFF->up notify-wake would pin 240 MHz for the whole
+     * time WiFi stays up. Release it before the block: the steady proxy path
+     * rides the DFS floor (heavy throughput would opt into a manual pmBoost()).
+     * Idempotent — a no-op once the count is gone. */
     pmBoostAuto(false);
-    if (maxFd >= 0) {
-        struct timeval tv = { 0, 10000 };
-        select(maxFd + 1, &rfds, &wfds, NULL, &tv);
-    } else {
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
+    netRelayWait(maxFd, &rfds, &wfds, held);
 
     /* Accept new connections */
     for (int ei = 0; ei < netEpCount; ei++) {
