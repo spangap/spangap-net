@@ -125,6 +125,7 @@ header.
 | `NET_EV_CFG_CHANGED` | A watched config key changed; `arg` is the key name. | Edge-only. |
 | `NET_EV_POLL` | Once per relay pass: ~10 ms while connected on a chip; on the Linux host target, on each wake — a socket, ITS traffic, a change under `s.net.` — and once a second while a client is held back for its owner. | Edge-only. |
 | `NET_EV_PORTS_CHANGED` | A public-facing listen socket opened or closed, or a registrant flipped `publicFacing`. Fires from the endpoint-open pass — the net task, or whoever wrote an `s.net.*` key — so a handler defers its work instead of doing it inline. | Edge-only. |
+| `NET_EV_STA_CONNECTING` | STA is about to join a known network; `arg` is the SSID. Fires on the net task after the station config is written and before `esp_wifi_connect()`, so a handler can set per-network driver state (WPA2-Enterprise credentials, say) for that join — and must clear it for every other SSID. | Edge-only. |
 
 ## Storage variables
 

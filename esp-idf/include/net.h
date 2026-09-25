@@ -80,6 +80,12 @@ enum {
                              net task and on whoever writes an s.net.* key, so a
                              handler defers its work rather than doing it inline.
                              Read the new set with netPublicPorts(). */
+    NET_EV_STA_CONNECTING, /* STA about to associate: the station config is
+                             written and esp_wifi_connect() comes right after
+                             the callbacks return. arg = the SSID. Fired on the
+                             net task, synchronously — the place to set up or
+                             tear down per-network driver state (e.g. WPA2-
+                             Enterprise credentials) for the join. Edge-only. */
     NET_EV_COUNT
 };
 

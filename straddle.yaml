@@ -169,7 +169,7 @@ settings:
   # ordered on their contributions rather than on init order.
   - at:
       - { id: net }
-      - { id: reachable, label: "Reachable from the internet", short: "Reachable", order: 2 }
+      - { id: reachable, label: "Reachable from the internet", short: "Reachable", order: 3 }
     order: 1
     rows:
       - title: "Reachable from the internet"

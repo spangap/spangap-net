@@ -883,6 +883,7 @@ static bool connectSta(int idx) {
   if (pass[0])
     strncpy((char*)wifi_config.sta.password, pass, sizeof(wifi_config.sta.password));
   esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+  fireEvent(NET_EV_STA_CONNECTING, ssid);
   xSemaphoreTake(wifiConnectedSem, 0);
   staConnected = false;
   esp_wifi_connect();
