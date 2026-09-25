@@ -166,6 +166,30 @@ static void wifi_event_handler(void* arg, esp_event_base_t base,
 
 /* ---- WiFi helpers ---- */
 
+#if CONFIG_ESP_WIFI_REMOTE_ENABLED
+/* A co-processor (esp_wifi_remote) can report the radio started twice for one
+ * start, and IDF's default handler attaches the netif to lwIP on every START —
+ * lwIP asserts on the second. A START for a netif already attached detaches it
+ * first, so the default handler's attach that follows is a clean re-attach. */
+static bool s_staAttached = false, s_apAttached = false;
+
+static void remoteStartDedupe(void*, esp_event_base_t, int32_t id, void*) {
+  switch (id) {
+    case WIFI_EVENT_STA_START:
+      if (s_staAttached && sta_netif) esp_netif_action_stop(sta_netif, nullptr, 0, nullptr);
+      s_staAttached = true;
+      break;
+    case WIFI_EVENT_STA_STOP: s_staAttached = false; break;
+    case WIFI_EVENT_AP_START:
+      if (s_apAttached && ap_netif) esp_netif_action_stop(ap_netif, nullptr, 0, nullptr);
+      s_apAttached = true;
+      break;
+    case WIFI_EVENT_AP_STOP:  s_apAttached = false; break;
+    default: break;
+  }
+}
+#endif
+
 static void wifiNetifInit() {
   /* esp_wifi warns about this on every single STA config write, and it is not a
      warning: a WPA2-length passphrase raising the authmode threshold off OPEN is
@@ -175,6 +199,10 @@ static void wifiNetifInit() {
 
   esp_netif_init();
   esp_event_loop_create_default();
+#if CONFIG_ESP_WIFI_REMOTE_ENABLED
+  /* Ahead of the defaults the next two calls register, so it runs first. */
+  esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &remoteStartDedupe, nullptr);
+#endif
   sta_netif = esp_netif_create_default_wifi_sta();
   ap_netif  = esp_netif_create_default_wifi_ap();
   esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, nullptr);
@@ -1067,6 +1095,17 @@ static void netCmdHandler(TaskHandle_t, const void* data, size_t len) {
   }
 }
 
+
+/* The relay waits on lwIP's select, which no task notification can end: ten
+ * milliseconds at most, so ITS traffic toward a socket waits no longer. */
+int netRelayWait(int maxFd, fd_set* rfds, fd_set* wfds, bool) {
+  if (maxFd >= 0) {
+    struct timeval tv = { 0, 10000 };
+    return select(maxFd + 1, rfds, wfds, NULL, &tv);
+  }
+  vTaskDelay(pdMS_TO_TICKS(10));
+  return 0;
+}
 
 static void netTaskFn(void* arg) {
   netRelayTaskInit();
