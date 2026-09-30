@@ -17,7 +17,7 @@ The socket relay is separate from the radio that carries it: `src/net_relay.cpp`
 holds the event bus, the listen sockets and the byte proxy, and a link backend
 drives it — WiFi on a chip (`src/net.cpp`), the host's loopback on ESP-IDF's
 Linux target (`src/host/`). That second backend is there for the simulated
-testbed — see `SIMesh/`.
+testbed — see `sim-mesh/`.
 
 ## Functions
 
